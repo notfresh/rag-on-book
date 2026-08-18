@@ -1,0 +1,5 @@
+# 生成物 / 可重建
+.vector/
+__pycache__/
+*.pyc
+books/*/parsed.jsonl
