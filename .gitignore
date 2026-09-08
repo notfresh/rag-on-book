@@ -1,5 +1,32 @@
-# 生成物 / 可重建
-.vector/
+# Python
 __pycache__/
-*.pyc
-books/*/parsed.jsonl
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 向量库备份（重建前手动备份用，正式 .vector 保留以避免 clone 后必须重建索引）
+.vector.bak.*/
+
+# 会话数据库（运行时生成，含历史问答）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
