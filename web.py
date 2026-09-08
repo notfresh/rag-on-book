@@ -1092,14 +1092,27 @@ async function send() {
   appendMsg('user', q);
   const placeholder = appendMsg('assistant', '正在检索 + 生成回答…');
 
+  const ctrl = new AbortController();
+  const guard = setTimeout(() => ctrl.abort(), 90000);  // LLM 生成上限保护
   try {
     const r = await fetch('/t/ragbook/api/ask', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ query:q, session_id:SID, top_k:5 })
+      body: JSON.stringify({ query:q, session_id:SID, top_k:5 }),
+      signal: ctrl.signal
     });
-    const d = await r.json();
+    // 先取文本再判断 JSON：空 body / 网关错误页不会让 json() 抛晦涩异常
+    const raw = await r.text();
+    let d = null;
+    if (raw && (r.headers.get('content-type') || '').includes('application/json')) {
+      try { d = JSON.parse(raw); } catch { d = null; }
+    }
     placeholder.remove();
-    if (d.error) {
+    if (!d) {
+      // 网关断连 / 截断 / 502 等：回答可能已生成，重拉会话同步
+      appendMsg('assistant', `⚠️ 服务响应异常（HTTP ${r.status}）。若回答已生成会自动显示，否则请稍后重试。`);
+      try { await loadSession(SID); } catch {}
+      $msgs.scrollTop = $msgs.scrollHeight;
+    } else if (d.error) {
       appendMsg('assistant', '⚠️ ' + d.error, d.hits || []);
     } else {
       const intentTag = d.intent ? ` · ${d.intent}[${d.intent_src}]` : '';
@@ -1113,7 +1126,13 @@ async function send() {
     }
   } catch (e) {
     placeholder.remove();
-    appendMsg('assistant', '⚠️ 网络错误：' + e.message);
+    if (e.name === 'AbortError') {
+      appendMsg('assistant', '⏳ 生成超过 90 秒被中断。回答可能仍在生成：请稍等几秒后刷新页面查看，或重新发送问题。');
+    } else {
+      appendMsg('assistant', '⚠️ 网络错误：' + e.message + '。请检查服务是否在线后重试。');
+    }
+  } finally {
+    clearTimeout(guard);
   }
   $btn.disabled = false;
   $q.focus();
@@ -1129,14 +1148,11 @@ function appendMsg(role, text, hits, meta) {
   } else {
     bodyHtml = escape(text || '');
   }
-  div.innerHTML = `
-    <div class="role">${role==='user'?'你':'书'}</div>
-    <div class="bubble">
-      ${bodyHtml}
-      ${hits && hits.length ? renderHits(hits) : ''}
-      ${meta ? `<div class="meta">${meta}</div>` : ''}
-    </div>
-  `;
+  // 注意：模板必须单行紧凑拼接——user 气泡有 white-space:pre-wrap，
+  // 跨行模板的换行/缩进会进入文本节点，把短消息撑成超高气泡
+  const hitsHtml = hits && hits.length ? renderHits(hits) : '';
+  const metaHtml = meta ? `<div class="meta">${meta}</div>` : '';
+  div.innerHTML = `<div class="role">${role==='user'?'你':'书'}</div><div class="bubble">${bodyHtml}${hitsHtml}${metaHtml}</div>`;
   const bubble = div.querySelector('.bubble');
   // 引用跳转（LLM 答案里的 [N]）
   bubble.addEventListener('click', e => {
