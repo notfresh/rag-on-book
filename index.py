@@ -99,10 +99,15 @@ SCHEMA_FIELDS = [
 
 
 def index_chunks(client, model, chunks):
-    """chunks → embedding → upsert。分批 + 休眠控制负载。返回块数。"""
+    """chunks → embedding → upsert。分批 + 休眠控制负载。返回块数。
+
+    V2（Layer 2）：把 heading_path 拼到 content 头部再编码，让 bge 看到章节位置。
+    这样"第N章"/"某节标题"这种元信息 token 在向量空间里也能参与相似度匹配。
+    """
     if not chunks:
         return 0
-    texts = [c["content"] for c in chunks]
+    # 拼接 heading_path 作为编码前缀（不入库，只用于 embedding）
+    texts = [f"【{c['heading_path']}】\n{c['content']}" for c in chunks]
     batch = []
     n_done = 0
     for i in range(0, len(texts), ENCODE_BATCH):
