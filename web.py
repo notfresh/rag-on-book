@@ -528,6 +528,8 @@ def api_ask():
                             "session_id": sid, "intent": "meta", "intent_src": "rule"}), 502
         llm_ms = int((time.time() - t0) * 1000)
         add_message(sid, "assistant", answer, hits=hits_clean, llm_ms=llm_ms)
+        # meta 路径也要自动给会话起标题
+        auto_title_if_new(sid, query)
         return jsonify({
             "session_id": sid,
             "answer": answer,
@@ -600,12 +602,7 @@ def api_ask():
     add_message(sid, "assistant", answer, hits=hits_clean, llm_ms=llm_ms)
 
     # 首问自动给会话起个标题（取问题前 30 字）
-    with _db() as c:
-        row = c.execute("SELECT title, (SELECT COUNT(*) FROM messages WHERE session_id=?) AS cnt FROM sessions WHERE id=?",
-                        (sid, sid)).fetchone()
-        if row and row["title"] == "新对话":
-            auto_title = (query[:30] + ("…" if len(query) > 30 else "")).strip()
-            c.execute("UPDATE sessions SET title=? WHERE id=?", (auto_title, sid))
+    auto_title_if_new(sid, query)
 
     return jsonify({
         "session_id": sid,
@@ -616,6 +613,15 @@ def api_ask():
         "intent": intent,
         "intent_src": intent_src,
     })
+
+
+def auto_title_if_new(sid: str, query: str):
+    """如果会话标题还是默认"新对话"，用 query 前 30 字设为标题。"""
+    with _db() as c:
+        row = c.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
+        if row and row["title"] == "新对话":
+            auto_title = (query[:30] + ("…" if len(query) > 30 else "")).strip()
+            c.execute("UPDATE sessions SET title=? WHERE id=?", (auto_title, sid))
 
 
 def _hits_clean(hits):
@@ -701,6 +707,24 @@ def api_session(sid):
     return jsonify({"session_id": sid, "messages": get_messages(sid)})
 
 
+@app.route("/api/chapter/<int:chapter>")
+def api_chapter(chapter: int):
+    """按需返回 DDIA 指定章完整 markdown（前端 marked 渲染）。
+
+    用于"点击引用 → 展开整章"功能，避免启动时预加载所有章。
+    """
+    if chapter < 1 or chapter > 14:
+        return jsonify({"error": f"DDIA 共 14 章，没有第{chapter}章"}), 404
+    md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "books", "ddia", "content", "zh", f"ch{chapter}.md")
+    if not os.path.exists(md_path):
+        return jsonify({"error": f"章节文件不存在: ch{chapter}.md"}), 404
+    with open(md_path, "r", encoding="utf-8") as f:
+        md_content = f.read()
+    # 算每节标题的锚 id（前端跳锚用）
+    return jsonify({"chapter": chapter, "markdown": md_content})
+
+
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True, "model_loaded": _model is not None, "db": DB_PATH})
@@ -712,6 +736,8 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>RAG on Book · DDIA 问答</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
   :root { --bg:#0f1419; --panel:#1a2028; --line:#2a3441; --fg:#d4dae3; --muted:#7a8694; --accent:#5b9dff; --user:#1e3a5f; --asst:#1f2c3a; --sidebar:#131922; }
   * { box-sizing:border-box; }
@@ -741,13 +767,27 @@ INDEX_HTML = r"""<!doctype html>
   header .sess-title[contenteditable=true] { background:#0f1419; padding:2px 8px; border-radius:4px; outline:1px solid var(--accent); }
 
   .chat { flex:1; overflow-y:auto; padding:20px; }
-  .msg { max-width:780px; margin:0 auto 16px; display:flex; gap:10px; }
+  .msg { max-width:780px; margin:0 auto 16px; display:flex; gap:10px; align-items:flex-start; }
   .msg .role { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0; }
   .msg.user .role { background:var(--user); }
   .msg.assistant .role { background:var(--asst); }
-  .msg .bubble { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 14px; line-height:1.6; white-space:pre-wrap; word-wrap:break-word; }
-  .msg.user .bubble { background:var(--user); border-color:#2a4a75; }
-  .hits { margin-top:6px; padding-top:6px; border-top:1px dashed var(--line); font-size:12px; color:var(--muted); }
+  .msg .bubble { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; line-height:1.6; word-wrap:break-word; width:fit-content; max-width:600px; min-height:0; align-self:flex-start; }
+  .msg.user .bubble { background:var(--user); border-color:#2a4a75; white-space:pre-wrap; padding:6px 12px; align-self:flex-end; }
+  .msg .bubble h1, .msg .bubble h2, .msg .bubble h3 { margin:8px 0 6px; line-height:1.3; }
+  .msg .bubble h1 { font-size:18px; }
+  .msg .bubble h2 { font-size:16px; }
+  .msg .bubble h3 { font-size:14px; }
+  .msg .bubble p { margin:4px 0; }
+  .msg .bubble ul, .msg .bubble ol { margin:4px 0; padding-left:22px; }
+  .msg .bubble li { margin:2px 0; }
+  .msg .bubble code { background:#0f1419; padding:1px 5px; border-radius:3px; font-size:12px; }
+  .msg .bubble pre { background:#0f1419; padding:8px 10px; border-radius:4px; overflow-x:auto; }
+  .msg .bubble blockquote { border-left:3px solid var(--accent); padding-left:10px; margin:6px 0; color:var(--muted); }
+  .msg .bubble a { color:var(--accent); }
+  .msg .bubble a.ref { color:#5b9dff; text-decoration:none; padding:1px 3px; border-radius:3px; background:rgba(91,157,255,0.1); font-weight:500; cursor:pointer; }
+  .msg .bubble a.ref:hover { background:rgba(91,157,255,0.25); }
+
+  .hits { margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); font-size:12px; color:var(--muted); }
   .hits-head { color:var(--muted); margin-bottom:4px; font-size:11px; }
   .hit-group { margin-bottom:2px; }
   .hit-group > summary { cursor:pointer; padding:4px 8px; background:#161d26; border-radius:4px; list-style:none; display:flex; justify-content:space-between; align-items:center; font-size:12px; }
@@ -756,12 +796,37 @@ INDEX_HTML = r"""<!doctype html>
   .hit-group[open] > summary::before { transform:rotate(90deg); }
   .hit-group .sec-name { color:var(--accent); font-weight:500; }
   .hit-group .sec-cnt { color:var(--muted); font-size:11px; }
-  .hit { margin:3px 0 0 0; padding:4px 8px; background:#121820; border-radius:4px; }
+  .hit { margin:3px 0 0 0; padding:6px 8px; background:#121820; border-radius:4px; scroll-margin-top:8px; transition:background 1.2s ease-out; }
+  .hit.highlight { background:rgba(91,157,255,0.25); }
   .hit .path { color:var(--accent); }
+  .hit .path .chap-link { color:var(--accent); text-decoration:none; cursor:pointer; padding:1px 4px; border-radius:3px; background:rgba(91,157,255,0.08); margin-left:4px; }
+  .hit .path .chap-link:hover { background:rgba(91,157,255,0.25); }
   .hit .score { color:#5b9dff; font-weight:500; }
   .hit .src { color:var(--muted); font-size:11px; margin-top:1px; }
-  .hit .snip { color:#9aa5b3; margin-top:2px; line-height:1.4; }
-  .meta { color:var(--muted); font-size:11px; margin-top:6px; }
+  .hit .snip { color:#9aa5b3; margin-top:3px; line-height:1.5; }
+
+  .chapter-expand { margin:6px 0 8px; background:#0a0e13; border:1px solid var(--line); border-radius:6px; }
+  .chapter-expand .head { display:flex; justify-content:space-between; align-items:center; padding:6px 12px; background:#161d26; border-bottom:1px solid var(--line); border-radius:6px 6px 0 0; }
+  .chapter-expand .head .title { color:var(--accent); font-size:13px; font-weight:500; }
+  .chapter-expand .head .close { background:transparent; border:0; color:var(--muted); cursor:pointer; font-size:14px; padding:0 4px; }
+  .chapter-expand .head .close:hover { color:var(--fg); }
+  .chapter-expand .body { padding:12px 16px; max-height:60vh; overflow-y:auto; line-height:1.7; }
+  .chapter-expand .body h1, .chapter-expand .body h2, .chapter-expand .body h3, .chapter-expand .body h4 {
+    color:var(--fg); margin:12px 0 6px; padding-top:6px;
+  }
+  .chapter-expand .body h1 { font-size:20px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+  .chapter-expand .body h2 { font-size:16px; color:var(--accent); scroll-margin-top:8px; }
+  .chapter-expand .body h3 { font-size:14px; color:#9aa5b3; scroll-margin-top:8px; }
+  .chapter-expand .body h4 { font-size:13px; color:var(--muted); }
+  .chapter-expand .body p { margin:6px 0; }
+  .chapter-expand .body ul, .chapter-expand .body ol { margin:6px 0; padding-left:24px; }
+  .chapter-expand .body blockquote { border-left:3px solid var(--accent); padding-left:10px; margin:8px 0; color:var(--muted); }
+  .chapter-expand .body code { background:#0f1419; padding:1px 5px; border-radius:3px; font-size:12px; }
+  .chapter-expand .body pre { background:#0f1419; padding:8px 10px; border-radius:4px; overflow-x:auto; }
+  .chapter-expand .body a { color:var(--accent); }
+  .chapter-expand .body .highlight-anchor { background:rgba(91,157,255,0.25); padding:2px 4px; border-radius:3px; transition:background 1.5s ease-out; }
+
+  .meta { color:var(--muted); font-size:11px; margin-top:8px; }
 
   footer { border-top:1px solid var(--line); padding:12px 20px; background:var(--panel); }
   .input-row { max-width:780px; margin:0 auto; display:flex; gap:8px; }
@@ -793,7 +858,8 @@ INDEX_HTML = r"""<!doctype html>
       试着问：<br><br>
       <code>DDIA 里事务隔离级别有哪些？</code><br>
       <code>LSM 树和 B+ 树的区别？</code><br>
-      <code>两阶段提交有什么问题？</code>
+      <code>两阶段提交有什么问题？</code><br>
+      <code>第一章有哪些内容？</code>
     </div>
   </div>
   <footer>
@@ -805,6 +871,73 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 
 <script>
+if (window.marked) {
+  marked.setOptions({ breaks: true, gfm: true, headerIds: true, headerPrefix: 'h-', mangle: false });
+}
+function md(text) {
+  if (!text) return '';
+  if (!window.marked || !window.DOMPurify) return escape(text);
+  const html = marked.parse(String(text));
+  return DOMPurify.sanitize(html, { ADD_ATTR: ['target', 'id'] });
+}
+function linkifyRefs(html) {
+  return html.replace(/\[(\d{1,2})\]/g, (m, n) => `<a href="#ref-${n}" class="ref" data-ref="${n}">[${n}]</a>`);
+}
+
+// ===== 章节缓存（key: chapter 数字 → 渲染好的 HTML + 锚点字典）=====
+const chapterCache = {};  // ch -> { html, anchorMap }
+
+// 把 markdown 的 heading 加上自定义 anchor id（slug 化中文）
+function slugifyHeading(s) {
+  // 简单中文 slug：保留汉字 + 拉丁字母数字，转 - ；md 本身已 headerIds 自动生成，
+  // 我们只额外确保唯一
+  return s.replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// 从 heading_path（如"第8章 事务 > 弱隔离级别 > 读已提交"）抽出
+// chapter（数字）和 target anchor（用于跳到该节）
+function parseHeadingPath(hp) {
+  const m = (hp || '').match(/第\s*(\d+)\s*章/);
+  const chapter = m ? m[1] : null;
+  // 跳过"第N章 ... "，剩下是层级路径，用 > 分隔
+  const parts = (hp || '').split(' > ');
+  const sectionPath = parts.slice(1).join(' > ');  // 去掉章
+  return { chapter, sectionPath, full: hp || '' };
+}
+
+async function loadChapter(chNum) {
+  if (chapterCache[chNum]) return chapterCache[chNum];
+  const r = await fetch(`/t/ragbook/api/chapter/${chNum}`);
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(d.error || `HTTP ${r.status}`);
+  }
+  const d = await r.json();
+  // marked 已给 heading 生成 id（headerPrefix: 'h-'），渲染完拿到 DOM 提取
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = md(d.markdown);
+  // 收集 heading id 映射（h.text → h.id），用于定位
+  const anchorMap = {};
+  wrapper.querySelectorAll('h1, h2, h3, h4').forEach(h => {
+    if (h.id) anchorMap[h.textContent.trim()] = h.id;
+  });
+  chapterCache[chNum] = { html: wrapper.innerHTML, anchorMap, title: wrapper.querySelector('h1')?.textContent || `第${chNum}章` };
+  return chapterCache[chNum];
+}
+
+// 找到最匹配的 anchor（精确 > 包含 > 第一章/章引言兜底）
+function findAnchor(chapterData, sectionPath) {
+  const m = chapterData.anchorMap;
+  if (!sectionPath) return null;
+  // 精确匹配
+  if (m[sectionPath]) return m[sectionPath];
+  // 包含匹配
+  for (const [text, id] of Object.entries(m)) {
+    if (sectionPath.includes(text) || text.includes(sectionPath)) return id;
+  }
+  return null;
+}
+
 let SID = localStorage.getItem('ragbook_sid') || null;
 const $list = document.getElementById('sessList');
 const $msgs = document.getElementById('msgs');
@@ -813,12 +946,10 @@ const $btn = document.getElementById('btn');
 const $title = document.getElementById('sessTitle');
 const $sessId = document.getElementById('sessId');
 
-// 标题双击重命名
 $title.addEventListener('dblclick', () => {
   const old = $title.textContent;
   $title.contentEditable = 'true';
   $title.focus();
-  // 全选
   const r = document.createRange(); r.selectNodeContents($title); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
   const finish = () => {
     $title.contentEditable = 'false';
@@ -952,7 +1083,6 @@ async function send() {
   const q = $q.value.trim();
   if (!q) return;
   if (!SID) {
-    // 没会话就建一个
     const r = await fetch('/t/ragbook/api/sessions', {method:'POST'});
     SID = (await r.json()).session_id;
   }
@@ -974,16 +1104,13 @@ async function send() {
     } else {
       const intentTag = d.intent ? ` · ${d.intent}[${d.intent_src}]` : '';
       appendMsg('assistant', d.answer || '（无回答）', d.hits || [], `检索 ${d.search_ms}ms · LLM ${d.llm_ms}ms${intentTag}`);
-      SID = d.session_id;  // 服务端可能新建了会话
+      SID = d.session_id;
       localStorage.setItem('ragbook_sid', SID);
+      await loadSessions();
+      document.querySelectorAll('.sess-item').forEach(el => el.classList.toggle('active', el.dataset.sid === SID));
+      const item = document.querySelector(`.sess-item[data-sid="${SID}"]`);
+      if (item) { $title.textContent = item.querySelector('.title > div').textContent; $sessId.textContent = SID.slice(0,8); }
     }
-    // 刷新侧栏（首问会改标题）
-    await loadSessions();
-    // 高亮当前会话
-    document.querySelectorAll('.sess-item').forEach(el => el.classList.toggle('active', el.dataset.sid === SID));
-    // 更新顶部标题
-    const item = document.querySelector(`.sess-item[data-sid="${SID}"]`);
-    if (item) { $title.textContent = item.querySelector('.title > div').textContent; $sessId.textContent = SID.slice(0,8); }
   } catch (e) {
     placeholder.remove();
     appendMsg('assistant', '⚠️ 网络错误：' + e.message);
@@ -996,23 +1123,114 @@ async function send() {
 function appendMsg(role, text, hits, meta) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
+  let bodyHtml;
+  if (role === 'assistant') {
+    bodyHtml = linkifyRefs(md(text || ''));
+  } else {
+    bodyHtml = escape(text || '');
+  }
   div.innerHTML = `
     <div class="role">${role==='user'?'你':'书'}</div>
-    <div class="bubble">${escape(text)}${hits && hits.length ? renderHits(hits) : ''}${meta ? `<div class="meta">${meta}</div>` : ''}</div>
+    <div class="bubble">
+      ${bodyHtml}
+      ${hits && hits.length ? renderHits(hits) : ''}
+      ${meta ? `<div class="meta">${meta}</div>` : ''}
+    </div>
   `;
+  const bubble = div.querySelector('.bubble');
+  // 引用跳转（LLM 答案里的 [N]）
+  bubble.addEventListener('click', e => {
+    const a = e.target.closest('a.ref');
+    if (!a) return;
+    e.preventDefault();
+    const n = a.dataset.ref;
+    jumpToRef(n, div);
+  });
+  // 章节展开（每条 hit 里的 📖 章节链接）
+  bubble.addEventListener('click', e => {
+    const link = e.target.closest('.chap-link');
+    if (!link) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openChapter(link, div);
+  });
   $msgs.appendChild(div);
   $msgs.scrollTop = $msgs.scrollHeight;
   return div;
 }
 
+// 在 hits 区域跳转高亮
+function jumpToRef(n, msgDiv) {
+  const target = msgDiv.querySelector(`.hit#ref-${n}`);
+  if (!target) return;
+  let p = target.parentElement;
+  while (p && p !== msgDiv) {
+    if (p.tagName === 'DETAILS' && !p.open) p.open = true;
+    p = p.parentElement;
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  target.classList.add('highlight');
+  setTimeout(() => target.classList.remove('highlight'), 1500);
+}
+
+// 点击 hit 的章节链接 → 在该 hit 下方展开整章 markdown
+async function openChapter(linkEl, msgDiv) {
+  const hitEl = linkEl.closest('.hit');
+  const chNum = linkEl.dataset.chapter;
+  const sectionPath = linkEl.dataset.section || '';
+  // 同一 hit 已经展开过 → 关闭
+  const existing = hitEl.nextElementSibling;
+  if (existing && existing.classList && existing.classList.contains('chapter-expand') && existing.dataset.chapter === chNum) {
+    existing.remove();
+    linkEl.textContent = '📖 展开本章';
+    return;
+  }
+  linkEl.textContent = '⏳ 加载中…';
+  try {
+    const data = await loadChapter(chNum);
+    // 删除可能存在的旧展开（不同章节）
+    if (existing && existing.classList && existing.classList.contains('chapter-expand')) {
+      existing.remove();
+    }
+    const div = document.createElement('div');
+    div.className = 'chapter-expand';
+    div.dataset.chapter = chNum;
+    div.innerHTML = `
+      <div class="head">
+        <span class="title">📖 ${escape(data.title)}</span>
+        <button class="close" title="收起">✕</button>
+      </div>
+      <div class="body">${data.html}</div>
+    `;
+    div.querySelector('.close').onclick = () => {
+      div.remove();
+      linkEl.textContent = '📖 展开本章';
+    };
+    hitEl.after(div);
+    // 跳到指定节
+    const anchor = findAnchor(data, sectionPath);
+    if (anchor) {
+      const target = div.querySelector('#' + CSS.escape(anchor));
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        target.classList.add('highlight-anchor');
+        setTimeout(() => target.classList.remove('highlight-anchor'), 1800);
+      }
+    } else {
+      div.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    linkEl.textContent = '📕 收起本章';
+  } catch (e) {
+    linkEl.textContent = '⚠️ ' + e.message;
+  }
+}
+
 function renderHits(hits) {
-  // 按 section 分组（meta 召回整章时尤其需要）
   const groups = {};
   hits.forEach((h, i) => {
     const parts = (h.heading_path || '').split(' > ');
     const section = parts.length >= 2 ? parts[1] : parts[0] || '其他';
-    const subsection = parts.length >= 3 ? parts[2] : '';
-    if (!groups[section]) groups[section] = { subsection, items: [], indices: [] };
+    if (!groups[section]) groups[section] = { items: [], indices: [] };
     groups[section].items.push(h);
     groups[section].indices.push(i + 1);
   });
@@ -1024,10 +1242,15 @@ function renderHits(hits) {
     html += `<details class="hit-group"><summary><span class="sec-name">${escape(sec)}</span><span class="sec-cnt">${idxRange} ${g.items.length}条</span></summary>`;
     g.items.forEach((h, k) => {
       const origIdx = g.indices[k];
-      html += `<div class="hit">
-        <div class="path">[${origIdx}] ${escape(h.heading_path)} <span class="score">${h.score}%</span></div>
+      const parsed = parseHeadingPath(h.heading_path);
+      const chapBtn = parsed.chapter
+        ? `<a class="chap-link" data-chapter="${parsed.chapter}" data-section="${escape(parsed.sectionPath)}">📖 展开本章</a>`
+        : '';
+      const snipMd = md('…' + (h.snippet || '') + '…');
+      html += `<div class="hit" id="ref-${origIdx}">
+        <div class="path">[${origIdx}] ${escape(h.heading_path)} <span class="score">${h.score}%</span>${chapBtn}</div>
         <div class="src">${escape(h.source)}</div>
-        <div class="snip">…${escape(h.snippet)}…</div>
+        <div class="snip">${snipMd}</div>
       </div>`;
     });
     html += `</details>`;
@@ -1044,11 +1267,9 @@ function escape(s) {
   return String(s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 }
 
-// 启动：先加载侧栏，再决定要不要切回上次的会话
 (async () => {
   await loadSessions();
   if (SID) {
-    // 验证 sid 还有效（如果被别处删了）
     const item = document.querySelector(`.sess-item[data-sid="${SID}"]`);
     if (item) {
       switchSession(SID);
