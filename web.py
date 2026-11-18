@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-RAG-on-Book Web 端 — Flask 后端（V2：会话管理 + SQLite 持久化）
+RAG on Book Web 端 — Flask 后端（V3：多书 + 新界面）
 监听 127.0.0.1:82，由任务101 反代 /t/ragbook/ 过来。
 
 复用 ask.py 的核心：search() / build_prompt() / ask_llm()
 进程级缓存：bge 模型只加载一次。
 
-V2 新增：
-- SQLite 持久化会话（/root/projects/rag-on-book/data/sessions.db）
-- 会话列表/重命名/删除/创建
-- 消息持久化（每条问答含 hits 都落库）
+V2：SQLite 持久化会话 + 会话管理 + 意图分类 + 元信息过滤
+V3（2026-11-18）：多书支持
+  - 书清单来自 books.py（manifest 是单一来源），不再硬编码 DDIA
+  - 元信息提问策略按书走：chapter_book 走"第N章"，note_set 走"主题名"
+  - 章节表从 outline.json 自动读，不再手写 CHAPTER_SECTIONS 字典
+  - 前端重写：书选择器 + 目录侧栏 + 右侧原文抽屉 + 新配色
 """
 
 import json
@@ -26,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flask import Flask, request, jsonify, render_template_string
 
 import ask
+import books as books_mod
 from index import ENCODE_THREADS
 
 app = Flask(__name__)
@@ -50,6 +53,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '新对话',
+                book TEXT,                    -- 会话绑定的书（多书支持，2026-11-18）
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -68,7 +72,15 @@ def init_db():
         """)
 
 
-def get_or_create_session(sid: str | None) -> str:
+def _ensure_book_column():
+    """老库补 book 列（ALTER 是元数据操作，不重写数据）。"""
+    with _db() as c:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(sessions)")]
+        if "book" not in cols:
+            c.execute("ALTER TABLE sessions ADD COLUMN book TEXT")
+
+
+def get_or_create_session(sid: str | None, book: str | None = None) -> str:
     """有 sid 就拿，没有就新建。返回 sid。"""
     if sid:
         with _db() as c:
@@ -79,8 +91,8 @@ def get_or_create_session(sid: str | None) -> str:
     new_sid = str(uuid.uuid4())
     now = time.time()
     with _db() as c:
-        c.execute("INSERT INTO sessions(id, title, created_at, updated_at) VALUES(?,?,?,?)",
-                  (new_sid, "新对话", now, now))
+        c.execute("INSERT INTO sessions(id, title, book, created_at, updated_at) VALUES(?,?,?,?,?)",
+                  (new_sid, "新对话", book, now, now))
     return new_sid
 
 
@@ -115,7 +127,7 @@ def list_sessions(limit: int = 50) -> list[dict]:
     """按 updated_at 倒序。"""
     with _db() as c:
         rows = c.execute(
-            """SELECT s.id, s.title, s.created_at, s.updated_at,
+            """SELECT s.id, s.title, s.book, s.created_at, s.updated_at,
                       (SELECT content FROM messages WHERE session_id=s.id AND role='user' ORDER BY id LIMIT 1) AS first_q,
                       (SELECT COUNT(*) FROM messages WHERE session_id=s.id) AS msg_count
                FROM sessions s ORDER BY s.updated_at DESC LIMIT ?""",
@@ -124,6 +136,7 @@ def list_sessions(limit: int = 50) -> list[dict]:
     return [{
         "id": r["id"],
         "title": r["title"],
+        "book": r["book"] or "",
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
         "first_q": r["first_q"] or "",
@@ -145,34 +158,53 @@ def delete_session(sid: str):
 
 # 初始化表（启动时）
 init_db()
+_ensure_book_column()
 
 
 # ---------- 全局模型客户端（进程复用） ----------
 _model = None
-_milvus = None
+_clients: dict[str, object] = {}   # book_id → MilvusClient（每本书一个独立库）
 _lock = Lock()
 
 
 def ensure_loaded():
-    """懒加载：第一次请求时才加载模型 + milvus client。"""
-    global _model, _milvus
-    if _model is not None and _milvus is not None:
-        return
+    """懒加载：第一次请求时才加载模型。
+
+    向量库客户端按书开 —— 每本书一个独立的 Milvus Lite 文件，
+    开着的客户端缓存在 _clients 里复用（Milvus Lite 是文件锁，重复打开会失败）。
+    """
+    global _model
+    if _model is None:
+        with _lock:
+            if _model is None:
+                import torch
+                torch.set_num_threads(ENCODE_THREADS)
+                from sentence_transformers import SentenceTransformer
+                print("[web] 加载 bge-small-zh-v1.5 ...", flush=True)
+                _model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+                print("[web] 模型就绪", flush=True)
+
+
+def get_book_client(book_id: str):
+    """取（并缓存）某本书的向量库客户端。"""
+    if book_id in _clients:
+        return _clients[book_id]
     with _lock:
-        if _model is not None and _milvus is not None:
-            return
-        import torch
-        torch.set_num_threads(ENCODE_THREADS)
-        from sentence_transformers import SentenceTransformer
+        if book_id in _clients:
+            return _clients[book_id]
         from index import get_client, COLLECTION
-        print("[web] 加载 bge-small-zh-v1.5 ...", flush=True)
-        _model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-        client = get_client()
+        if not books_mod.has_vector_store(book_id):
+            raise RuntimeError(
+                f"书 {book_id} 没有向量库, 先跑 python3 index.py --book {book_id}")
+        client = get_client(book_id)
         if not client.has_collection(COLLECTION):
-            raise RuntimeError("向量库不存在, 先跑 python3 index.py --full")
+            raise RuntimeError(
+                f"书 {book_id} 的向量库里没有 collection, 先跑 "
+                f"python3 index.py --book {book_id}")
         client.load_collection(COLLECTION)
-        _milvus = client
-        print("[web] 模型 + milvus 就绪", flush=True)
+        _clients[book_id] = client
+        print(f"[web] 向量库就绪: {book_id}", flush=True)
+        return client
 
 
 # ---------- 意图分类（V2 多轮对话管理） ----------
@@ -180,7 +212,7 @@ def ensure_loaded():
 
 # 规则初筛：纯问候词 / 寒暄（不区分大小写、不去标点）
 _CHITCHAT_PATTERNS = [
-    "你好", "您好", "你好啊", "你好呀", "你好呀", "hi", "HI", "Hi",
+    "你好", "您好", "你好啊", "你好呀", "hi", "HI", "Hi",
     "hello", "Hello", "HELLO", "嗨", "哈喽", "哈啰",
     "在吗", "在么", "在?", "在？",
     "你是谁", "你叫什么", "你叫啥",
@@ -209,7 +241,7 @@ def llm_classify(query: str, history_tail: list[dict] | None = None) -> str:
     """
     history_ctx = ""
     if history_tail:
-        history_ctx = "\n\n最近对话:\n" + "\n".join(
+        history_ctx = "\n\n最近对话:\n" + "\n\n".join(
             f"[{m['role']}] {m['content'][:200]}" for m in history_tail
         ) + "\n\n如果用户最新消息明显在追问上文（用代词/省略/接续），判 followup。"
     prompt = f"""你是意图路由器。根据用户最新消息判断意图：
@@ -228,15 +260,11 @@ question: 新提问（独立问题，可不依赖上下文回答）
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
             "max_tokens": 8,
+            "reasoning_split": True,
+            "thinking": {"type": "disabled"},
         }
-        import urllib.request
-        req = urllib.request.Request(
-            ask.BASE_URL, data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {ask.load_deepseek_key()}"},
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-            ans = data["choices"][0]["message"]["content"].strip().lower()
+        data = ask.post_llm(body, timeout=20)
+        ans = (ask._message_content(data) or "").strip().lower()
         for label in ("chitchat", "followup", "question"):
             if label in ans:
                 return label
@@ -254,163 +282,16 @@ def classify(query: str, history_tail: list[dict] | None = None) -> tuple[str, s
 
 
 # ---------- 闲聊路径 ----------
-CHITCHAT_SYSTEM = """你是《设计数据密集型应用》(DDIA) 的读书搭子。用户当前没有具体问题，只是闲聊或打招呼。
-请用轻松友好的口吻简短回应（不超过 80 字），不主动背诵书的目录、不重复介绍自己。
-可以适度幽默，但不要油嘴滑舌。"""
-
-
-# ---------- Layer 1: 元信息过滤（"第N章" 精确召回） ----------
-# parse.py 已经把 chapter 存成数字字符串 "1"-"14"，section 存成中文标题
-import re
-
-# DDIA 章节白名单（14 章 + 各自 section）
-META_BOOK = "ddia"  # 现在只支持 DDIA
-
-CHAPTER_SECTIONS = {
-    "1": ["章引言", "分析型与事务型系统", "云服务与自托管", "分布式与单节点系统", "数据系统、法律与社会"],
-    "2": ["章引言", "描述性能", "可靠性与容错", "可维护性", "可伸缩性", "案例研究：社交网络首页时间线"],
-    "3": ["章引言", "关系模型与文档模型", "图数据模型", "数据框、矩阵与数组", "事件溯源与 CQRS"],
-    "4": ["章引言", "OLTP 系统的存储与索引", "分析型数据存储", "多维索引与全文索引"],
-    "5": ["章引言", "编码数据的格式", "数据流的模式"],
-    "6": ["章引言", "单主复制", "复制延迟的问题", "多主复制", "无主复制"],
-    "7": ["章引言", "键值数据的分片", "分片与二级索引", "请求路由", "分片的利与弊"],
-    "8": ["章引言", "事务到底是什么？", "弱隔离级别", "可串行化", "分布式事务"],
-    "9": ["章引言", "故障与部分失效", "不可靠的网络", "不可靠的时钟", "知识、真相和谎言"],
-    "10": ["章引言", "线性一致性", "共识", "ID 生成器和逻辑时钟"],
-    "11": ["章引言", "批处理模型", "批处理用例", "分布式系统中的批处理", "使用 Unix 工具的批处理"],
-    "12": ["章引言", "传递事件流", "数据库与流", "流处理"],
-    "13": ["章引言", "数据集成", "追求正确性", "分拆数据库"],
-    "14": ["章引言", "隐私与追踪", "预测分析"],
-}
-# chapter 数字 → 中文标题（用于回答里给 LLM 看上下文）
-CHAPTER_TITLES = {
-    "1": "数据系统架构中的权衡", "2": "定义非功能性需求", "3": "数据模型与查询语言",
-    "4": "存储与检索", "5": "编码与演化", "6": "复制", "7": "分片", "8": "事务",
-    "9": "分布式系统的麻烦", "10": "一致性与共识", "11": "批处理", "12": "流处理",
-    "13": "流式系统的哲学", "14": "做正确的事情",
-}
-
-
-def _fuzzy_match_section(section_hint: str, chapter: str) -> str | None:
-    """在指定章的 section 白名单里模糊匹配用户说的关键词。返回标准 section 名。"""
-    candidates = CHAPTER_SECTIONS.get(chapter, [])
-    hint = section_hint.strip()
-    if not hint:
-        return None
-    # 精确相等
-    if hint in candidates:
-        return hint
-    # 包含关系
-    for c in candidates:
-        if hint in c or c in hint:
-            return c
-    # 首字 + 关键字（如"事务"匹配"事务到底是什么？" / "弱隔离级别"）
-    # 取 hint 中 2 字以上的中文片段去匹配
-    for length in (4, 3, 2):
-        for i in range(len(hint) - length + 1):
-            sub = hint[i:i+length]
-            if not re.match(r'^[\u4e00-\u9fa5]+$', sub):
-                continue
-            for c in candidates:
-                if sub in c:
-                    return c
-    return None
-
-
-def detect_meta_query(query: str) -> tuple[str | None, dict]:
-    """检测 query 是不是元信息提问（"第N章"/"chN"/"第N章第X节"）。
-
-    返回 (milvus_filter_expr, meta_info)。两者都为 None 表示不是元信息提问，走 bge 向量检索。
-    """
-    q = query.strip()
-    # 1. 章节号识别（阿拉伯数字 + 中文数字）
-    ch_num = None
-    # 阿拉伯数字：第1章 / 第 1 章
-    m = re.search(r'第\s*(\d{1,2})\s*章', q)
-    if m:
-        ch_num = m.group(1)
-    if not ch_num:
-        # 中文数字：第一章 / 第一章是什么
-        m = re.search(r'第([一二三四五六七八九十]+)\s*章', q)
-        if m:
-            cn = m.group(1)
-            cn_map = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10"}
-            # 支持组合：十三=10+3，二十五=20+5，二十三=20+3，二十=20
-            if cn in cn_map:
-                ch_num = cn_map[cn]
-            elif len(cn) == 2 and cn[0] == "十":
-                ch_num = "1" + cn_map.get(cn[1], "")
-            elif len(cn) == 2 and cn[1] == "十":
-                ch_num = str(int(cn_map.get(cn[0],"0")) * 10)
-            elif len(cn) == 3 and cn[1] == "十":
-                ch_num = str(int(cn_map.get(cn[0],"0")) * 10 + int(cn_map.get(cn[2],"0")))
-            else:
-                ch_num = None
-    if not ch_num:
-        m = re.search(r'\bch\s*(\d{1,2})\b', q, re.IGNORECASE)
-        if m:
-            ch_num = m.group(1)
-    if not ch_num:
-        return None, {}
-    if ch_num not in CHAPTER_SECTIONS:
-        # 边界：用户问的章号超出 DDIA 范围（1-14）。返 out_of_range 让上层直接提示。
-        return None, {"out_of_range": True, "max_chapter": len(CHAPTER_SECTIONS), "chapter": ch_num}
-
-    # 2. 章节白名单里的章节：chapter == "N"
-    # 不调 bge，纯精确召回（用 query 中"章号之后的部分"做关键词，让 LLM 提炼）
-    ch_title = CHAPTER_TITLES[ch_num]
-
-    # 3. 是否点名了节（query 含"章引言"/"可串行化"/"事务到底是什么"等关键词）
-    section_hint = ""
-    # 把"第N章"和"是什么/讲什么/总结"等噪声词去掉，剩下的去匹配 section
-    noise = re.sub(r'第\s*\d{1,2}\s*章', '', q)
-    noise = re.sub(r'(是什么|讲什么|讲讲|介绍|总结|主要内容|大概|简介|讲的什么|说的是|内容是)', '', noise)
-    noise = noise.strip(" ？?，,。.：: ")
-    section_hint = noise
-
-    matched_section = None
-    if section_hint:
-        matched_section = _fuzzy_match_section(section_hint, ch_num)
-
-    if matched_section:
-        # 精确到节：用 section 过滤，再按章节内 chunk 顺序（pk）排序
-        filter_expr = f"chapter == '{ch_num}' && section == '{matched_section}'"
-        return filter_expr, {
-            "chapter": ch_num,
-            "chapter_title": ch_title,
-            "section": matched_section,
-            "skip_embedding": True,
-            "sort_by": "pk",  # 该节内按 markdown 顺序
-        }
-    else:
-        # 精确到章：召回整章所有块
-        filter_expr = f"chapter == '{ch_num}'"
-        return filter_expr, {
-            "chapter": ch_num,
-            "chapter_title": ch_title,
-            "section": None,
-            "skip_embedding": True,
-            "sort_by": "pk",
-        }
-
-
-def meta_search(client, filter_expr: str, meta_info: dict) -> list[dict]:
-    """元信息精确召回：用 filter 查 milvus，按 pk 升序（章节内顺序）。"""
-    from index import COLLECTION
-    res = client.query(
-        COLLECTION,
-        filter=filter_expr,
-        output_fields=["book", "part", "chapter", "chapter_title", "section",
-                       "subsection", "heading_path", "source", "content"],
-        limit=200,  # 一章最多也就几十块
-        sort="pk",  # milvus query 支持 sort
-    )
-    return res
-
-
-def chitchat_reply(query: str, history_tail: list[dict] | None = None) -> str:
+def chitchat_reply(query: str, history_tail: list[dict] | None = None, book_id: str | None = None) -> str:
     """闲聊直接对话，不检索。"""
-    msgs = [{"role": "system", "content": CHITCHAT_SYSTEM}]
+    display, author = ask.book_context(book_id)
+    who = f"{display}（{author}）" if author else display
+    msgs = [{
+        "role": "system",
+        "content": f"""你是{who}的读书搭子。用户当前没有具体问题，只是闲聊或打招呼。
+请用轻松友好的口吻简短回应（不超过 80 字），不主动背诵书的目录、不重复介绍自己。
+可以适度幽默，但不要油嘴滑舌。""",
+    }]
     if history_tail:
         # 闲聊也带历史（聊天气氛连贯）
         for m in history_tail[-6:]:
@@ -422,22 +303,147 @@ def chitchat_reply(query: str, history_tail: list[dict] | None = None) -> str:
             "messages": msgs,
             "temperature": 0.7,
             "max_tokens": 200,
+            "reasoning_split": True,
+            "thinking": {"type": "disabled"},
         }
-        import urllib.request
-        req = urllib.request.Request(
-            ask.BASE_URL, data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {ask.load_deepseek_key()}"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-            return data["choices"][0]["message"]["content"].strip()
+        data = ask.post_llm(body, timeout=30)
+        content = ask._message_content(data)
+        if content is None:
+            return "（闲聊回应失败：LLM 未返回正文 content）"
+        return ask.strip_think(content.strip())
     except Exception as e:
         return f"（闲聊回应失败：{e}）"
 
 
+# ---------- Layer 1：元信息过滤（精确召回，不调 embedding） ----------
+# 两种策略，由书的 manifest 决定：
+#   chapter_book → "第N章" / "第N章某节"
+#   note_set     → 主题名（书名或分组名）
+import re
+
+
+_outline_cache: dict[str, dict] = {}
+
+
+def get_outline(book_id: str) -> dict:
+    """读某本书的目录树（parse.py 生成的 outline.json）。"""
+    if book_id in _outline_cache:
+        return _outline_cache[book_id]
+    path = os.path.join(books_mod.BOOKS_DIR, book_id, "outline.json")
+    if not os.path.exists(path):
+        return {"kind": "topic", "items": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {"kind": "topic", "items": []}
+    _outline_cache[book_id] = data
+    return data
+
+
+def detect_meta_query(query: str, book: dict) -> tuple[str | None, dict]:
+    """检测 query 是不是元信息提问。返回 (milvus_filter_expr, meta_info)。
+
+    两个都为空表示不是元信息提问，走 bge 向量检索。
+    """
+    meta_cfg = book.get("meta") or {}
+    meta_kind = meta_cfg.get("kind")
+    book_id = book["id"]
+
+    if meta_kind == books_mod.META_CHAPTER:
+        return _detect_chapter_query(query, book)
+    if meta_kind == books_mod.META_TOPIC:
+        return _detect_topic_query(query, book)
+    return None, {}
+
+
+def _detect_chapter_query(query: str, book: dict) -> tuple[str | None, dict]:
+    """章节式："第N章" / "第N章某节"。
+
+    章节表从 outline.json 读（parse.py 自动生成），不再手写硬编码字典。
+    """
+    outline = get_outline(book["id"])
+    items = outline.get("items") or []
+    by_key = {it["key"]: it for it in items}
+
+    ch_num = books_mod.detect_chapter_num(query)
+    if not ch_num:
+        return None, {}
+    if ch_num not in by_key:
+        # 边界：用户问的章号超出范围 → 上层直接提示，不调 LLM
+        return None, {"out_of_range": True, "max_chapter": len(items), "chapter": ch_num}
+
+    item = by_key[ch_num]
+    ch_title = item.get("title", "")
+
+    # 是否点名了节（把"第N章"和"是什么/讲什么"等噪声词去掉，剩下的去匹配小节）
+    noise = re.sub(r'第\s*\d{1,3}\s*章', '', query)
+    noise = re.sub(r'(是什么|讲什么|讲讲|介绍|总结|主要内容|大概|简介|讲的什么|说的是|内容是)', '', noise)
+    noise = noise.strip(" ？?，,。.：: ")
+    matched = books_mod.fuzzy_match_section(noise, item.get("sections") or []) if noise else None
+
+    if matched:
+        filter_expr = f"book == '{book['id']}' && chapter == '{ch_num}' && section == '{matched}'"
+        return filter_expr, {
+            "chapter": ch_num, "chapter_title": ch_title, "section": matched,
+            "skip_embedding": True, "sort_by": "pk", "book": book["id"],
+        }
+    filter_expr = f"book == '{book['id']}' && chapter == '{ch_num}'"
+    return filter_expr, {
+        "chapter": ch_num, "chapter_title": ch_title, "section": None,
+        "skip_embedding": True, "sort_by": "pk", "book": book["id"],
+    }
+
+
+def _detect_topic_query(query: str, book: dict) -> tuple[str | None, dict]:
+    """主题式：认出主题名（书名或分组名）→ 精确召回该主题的全部块。
+
+    note_set 没有"第N章"，主题名就是一级定位。
+    """
+    outline = get_outline(book["id"])
+    topic = books_mod.match_topic(query, book, outline)
+    if not topic:
+        return None, {}
+
+    outline = get_outline(book["id"])
+    # 主题可能是分组名（"算法"）或具体文件名（"快速排序"）
+    group_names = [it["key"] for it in outline.get("items") or []]
+    if topic in group_names:
+        # 分组级：召回该组下所有文件 —— 用 part 字段过滤
+        filter_expr = f"book == '{book['id']}' && part == '{topic}'"
+        return filter_expr, {
+            "topic": topic, "scope": "group", "skip_embedding": True,
+            "sort_by": "pk", "book": book["id"],
+        }
+
+    # 文件级：chapter_title 存的是主题名（文件名去掉分组前缀）
+    filter_expr = f"book == '{book['id']}' && chapter_title == '{topic}'"
+    return filter_expr, {
+        "topic": topic, "scope": "file", "skip_embedding": True,
+        "sort_by": "pk", "book": book["id"],
+    }
+
+
+def meta_search(client, filter_expr: str, meta_info: dict) -> list[dict]:
+    """元信息精确召回：用 filter 查 milvus，按 pk 升序（章节内顺序）。"""
+    from index import COLLECTION
+    res = client.query(
+        COLLECTION,
+        filter=filter_expr,
+        output_fields=["book", "part", "chapter", "chapter_title", "section",
+                       "subsection", "heading_path", "source", "content"],
+        limit=400,  # 一章/一个主题最多也就几百块
+        sort="pk",  # milvus query 支持 sort
+    )
+    return res
+
+
 # ---------- 提问/追问路径：历史拼进 prompt ----------
-def build_prompt_with_history(query: str, hits: list, history_tail: list[dict]) -> str:
+def build_prompt_with_history(query: str, hits: list, history_tail: list[dict],
+                              book_id: str | None = None) -> str:
     """在 ask.build_prompt 基础上，把最近 2 轮问答拼进 prompt，让 LLM 理解代词/省略。"""
+    display, author = ask.book_context(book_id)
+    who = f"{display}（{author}）" if author else display
     parts = []
     for i, h in enumerate(hits, 1):
         loc = h["heading_path"]
@@ -451,7 +457,7 @@ def build_prompt_with_history(query: str, hits: list, history_tail: list[dict]) 
             f"[{m['role']}] {m['content'][:300]}" for m in history_tail[-4:]  # 最近 2 轮 = 4 条
         ) + "\n"
 
-    return f"""你是一位精通《设计数据密集型应用》(DDIA) 的读书助手。
+    return f"""你是一位精通{who}的读书助手。
 请严格根据下面给出的书中片段回答问题。规则:
 1. 只依据片段内容回答; 片段没有的信息, 明确说"书中片段未涉及"。
 2. 每个关键论断后标注引用编号 [N]（对应片段编号）。
@@ -465,61 +471,130 @@ def build_prompt_with_history(query: str, hits: list, history_tail: list[dict]) 
 
 
 # ---------- 路由 ----------
+def _parse_json_body() -> dict:
+    """宽容的 JSON body 解析，替代 request.get_json(silent=True)。
+
+    - 接受裸换行（\x0a）等控制字符：textarea 内容里用户按回车会产生裸 \n，
+      默认 strict JSON parser 会拒绝、Flask get_json(silent=True) 返 None，
+      进而 `data.get("query") or ""` 拿到 ""，触发 "query 不能为空"。
+    - 解析失败（含空 body / 非 JSON）返空 dict，行为与 silent=True 一致。
+    """
+    raw = request.get_data(cache=False, as_text=True)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw, strict=False) or {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _resolve_book(book_id: str | None) -> dict | None:
+    """取指定书；取不到或没指定 → 第一本已建索引的书。"""
+    try:
+        if book_id:
+            return books_mod.get_book(book_id)
+        candidates = [b for b in books_mod.list_books() if b.get("chunk_count")]
+        return candidates[0] if candidates else None
+    except books_mod.BookError:
+        return None
+
+
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML)
 
 
+@app.route("/api/books")
+def api_books():
+    """书清单 + 目录树（前端渲染书选择器与目录侧栏）。"""
+    out = []
+    for b in books_mod.list_books():
+        outline = get_outline(b["id"])
+        out.append({
+            "id": b["id"],
+            "title": b["title"],
+            "subtitle": b.get("subtitle", ""),
+            "author": b.get("author", ""),
+            "kind": b["kind"],
+            "meta_kind": b.get("meta", {}).get("kind", ""),
+            "chunk_count": b.get("chunk_count", 0),
+            "outline": outline,
+        })
+    return jsonify({"books": out})
+
+
+@app.route("/api/outline/<book_id>")
+def api_outline(book_id):
+    """单本书的目录树。"""
+    try:
+        books_mod.get_book(book_id)
+    except books_mod.BookError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify({"book_id": book_id, "outline": get_outline(book_id)})
+
+
 @app.route("/api/ask", methods=["POST"])
 def api_ask():
-    data = request.get_json(silent=True) or {}
+    # 宽容 JSON 解析：textarea 内容里裸换行符（\x0a）会被默认 strict parser 拒绝，
+    # 触发 "query 不能为空"。strict=False 接受裸控制字符。
+    data = _parse_json_body()
     query = (data.get("query") or "").strip()
     sid_in = data.get("session_id")
     top_k = int(data.get("top_k") or 5)
-    book = data.get("book") or None
+    book_id = data.get("book") or None
     no_llm = bool(data.get("no_llm"))
 
     if not query:
         return jsonify({"error": "query 不能为空"}), 400
 
-    sid = get_or_create_session(sid_in)
+    book = _resolve_book(book_id)
+    if book is None:
+        return jsonify({"error": "没有可用的书（先跑 parse.py + index.py）"}), 503
+    book_id = book["id"]
+
+    sid = get_or_create_session(sid_in, book=book_id)
 
     # 拉最近 4 条历史（用于意图分类 + prompt 拼历史）
     history_tail = get_messages(sid)[-4:] if sid else []
 
-    # 0. 元信息提问（"第N章"/"第N章某节"）→ 优先精确召回，跳过 bge + 闲聊分类
-    meta_filter, meta_info = detect_meta_query(query)
+    # 0. 元信息提问（"第N章"/主题名）→ 优先精确召回，跳过 bge + 闲聊分类
+    meta_filter, meta_info = detect_meta_query(query, book)
     if meta_info.get("out_of_range"):
         # 章节号超出范围：明确告诉用户，避免 LLM 误判
-        max_ch = meta_info.get("max_chapter", 14)
+        max_ch = meta_info.get("max_chapter", 0)
         ch_num_oob = meta_info.get("chapter", "?")
-        msg = f"DDIA 共 {max_ch} 章，没有第{ch_num_oob}章。"
-        sid_record = get_or_create_session(sid_in)
-        add_message(sid_record, "user", query)
-        add_message(sid_record, "assistant", msg, hits=[], llm_ms=0)
-        return jsonify({"session_id": sid_record, "answer": msg, "hits": [],
-                        "search_ms": 0, "llm_ms": 0,
+        display, _ = ask.book_context(book_id)
+        msg = f"{display} 共 {max_ch} 章，没有第{ch_num_oob}章。"
+        add_message(sid, "user", query)
+        add_message(sid, "assistant", msg, hits=[], llm_ms=0)
+        return jsonify({"session_id": sid, "answer": msg, "hits": [],
+                        "search_ms": 0, "llm_ms": 0, "book": book_id,
                         "intent": "meta_oob", "intent_src": "rule"})
     if meta_filter:
         try:
             ensure_loaded()
+            book_client = get_book_client(book_id)
         except Exception as e:
             return jsonify({"error": f"模型加载失败: {e}"}), 500
         add_message(sid, "user", query)
         t0 = time.time()
-        chunks = meta_search(_milvus, meta_filter, meta_info)
+        chunks = meta_search(book_client, meta_filter, meta_info)
         search_ms = int((time.time() - t0) * 1000)
         if not chunks:
-            msg = f"未找到第{meta_info.get('chapter','')}章的内容"
-            if meta_info.get('section'):
-                msg += f"「{meta_info['section']}」节"
+            msg = f"未找到相关内容"
+            if meta_info.get("chapter"):
+                msg = f"未找到第{meta_info['chapter']}章的内容"
+                if meta_info.get("section"):
+                    msg += f"「{meta_info['section']}」节"
+            elif meta_info.get("topic"):
+                msg = f"未找到「{meta_info['topic']}」相关内容"
             add_message(sid, "assistant", msg, hits=[], llm_ms=0)
             return jsonify({"session_id": sid, "answer": msg, "hits": [],
-                            "search_ms": search_ms, "llm_ms": 0,
+                            "search_ms": search_ms, "llm_ms": 0, "book": book_id,
                             "intent": "meta", "intent_src": "rule"})
         # 用元信息专用 prompt（不限制"严格按片段"）
         hits_clean = [_hit_to_clean(c, score=100) for c in chunks]  # meta 召回不打分
-        prompt = build_meta_prompt(query, chunks, meta_info)
+        prompt = build_meta_prompt(query, chunks, meta_info, book_id)
         t0 = time.time()
         try:
             answer = ask.ask_llm(prompt)
@@ -536,6 +611,7 @@ def api_ask():
             "hits": hits_clean,
             "search_ms": search_ms,
             "llm_ms": llm_ms,
+            "book": book_id,
             "intent": "meta",
             "intent_src": "rule",
             "meta": meta_info,
@@ -548,7 +624,7 @@ def api_ask():
     if intent == "chitchat":
         t0 = time.time()
         try:
-            answer = chitchat_reply(query, history_tail=history_tail)
+            answer = chitchat_reply(query, history_tail=history_tail, book_id=book_id)
         except Exception as e:
             return jsonify({"error": f"闲聊 LLM 失败: {e}", "session_id": sid}), 502
         llm_ms = int((time.time() - t0) * 1000)
@@ -562,6 +638,7 @@ def api_ask():
             "hits": [],
             "search_ms": 0,
             "llm_ms": llm_ms,
+            "book": book_id,
             "intent": intent,
             "intent_src": intent_src,
         })
@@ -569,11 +646,12 @@ def api_ask():
     # 3. 提问/追问路径：检索 + LLM
     try:
         ensure_loaded()
+        book_client = get_book_client(book_id)
     except Exception as e:
         return jsonify({"error": f"模型加载失败: {e}"}), 500
 
     t0 = time.time()
-    hits = ask.search(_milvus, _model, query, book=book, top_k=top_k)
+    hits = ask.search(book_client, _model, query, book=book_id, top_k=top_k)
     search_ms = int((time.time() - t0) * 1000)
 
     add_message(sid, "user", query)
@@ -581,7 +659,7 @@ def api_ask():
     if not hits:
         add_message(sid, "assistant", "（未命中任何片段）", hits=[], llm_ms=0)
         return jsonify({"session_id": sid, "answer": "（未命中任何片段）", "hits": [],
-                        "search_ms": search_ms, "llm_ms": 0,
+                        "search_ms": search_ms, "llm_ms": 0, "book": book_id,
                         "intent": intent, "intent_src": intent_src})
 
     if no_llm:
@@ -590,7 +668,7 @@ def api_ask():
     else:
         t0 = time.time()
         # 追问路径：把历史拼进 prompt；提问路径也拼（无害，prompt 明确说"如不依赖可忽略"）
-        prompt = build_prompt_with_history(query, hits, history_tail)
+        prompt = build_prompt_with_history(query, hits, history_tail, book_id)
         try:
             answer = ask.ask_llm(prompt)
         except Exception as e:
@@ -610,6 +688,7 @@ def api_ask():
         "hits": hits_clean,
         "search_ms": search_ms,
         "llm_ms": llm_ms,
+        "book": book_id,
         "intent": intent,
         "intent_src": intent_src,
     })
@@ -621,7 +700,7 @@ def auto_title_if_new(sid: str, query: str):
         row = c.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
         if row and row["title"] == "新对话":
             auto_title = (query[:30] + ("…" if len(query) > 30 else "")).strip()
-            c.execute("UPDATE sessions SET title=? WHERE id=?", (auto_title, sid))
+            c.execute("UPDATE sessions SET title=?, updated_at=? WHERE id=?", (auto_title, sid, time.time()))
 
 
 def _hits_clean(hits):
@@ -629,6 +708,7 @@ def _hits_clean(hits):
     for h in hits:
         out.append({
             "score": h["score"],
+            "book": h.get("book", ""),
             "heading_path": h["heading_path"],
             "source": h["source"],
             "snippet": h["content"][:240].replace("\n", " "),
@@ -640,21 +720,26 @@ def _hit_to_clean(c: dict, score: int = 100) -> dict:
     """milvus query() 返回的实体转 citation dict（meta 召回默认 score=100）。"""
     return {
         "score": score,
+        "book": c.get("book", ""),
         "heading_path": c.get("heading_path", ""),
         "source": c.get("source", ""),
         "snippet": c.get("content", "")[:240].replace("\n", " "),
     }
 
 
-def build_meta_prompt(query: str, chunks: list[dict], meta_info: dict) -> str:
-    """元信息提问专用 prompt：拿到指定章/节的全文，让 LLM 自由总结/介绍。"""
-    ch = meta_info.get("chapter")
-    ch_title = meta_info.get("chapter_title", "")
-    section = meta_info.get("section")
+def build_meta_prompt(query: str, chunks: list[dict], meta_info: dict, book_id: str | None = None) -> str:
+    """元信息提问专用 prompt：拿到指定章/节/主题的全文，让 LLM 自由总结/介绍。"""
+    display, author = ask.book_context(book_id)
+    who = f"{display}（{author}）" if author else display
 
-    scope = f"第{ch}章「{ch_title}」"
-    if section:
-        scope += f"「{section}」节"
+    if meta_info.get("chapter"):
+        scope = f"第{meta_info['chapter']}章「{meta_info.get('chapter_title','')}」"
+        if meta_info.get("section"):
+            scope += f"「{meta_info['section']}」节"
+    elif meta_info.get("topic"):
+        scope = f"「{meta_info['topic']}」主题"
+    else:
+        scope = "相关内容"
 
     parts = []
     for i, c in enumerate(chunks, 1):
@@ -662,10 +747,10 @@ def build_meta_prompt(query: str, chunks: list[dict], meta_info: dict) -> str:
         parts.append(f"[{i}] {loc}\n{c.get('content','')}")
     context = "\n\n".join(parts)
 
-    return f"""你是《设计数据密集型应用》(DDIA) 的读书助手。用户询问的是书的 {scope}。
+    return f"""你是{who}的读书助手。用户询问的是 {scope}。
 
-下面是该章/节按书内顺序排列的全部内容（可能较长）。请根据用户的具体问题：
-1. 如果用户问"是什么/讲什么/主要内容"：用结构化方式总结该章/节的核心主题、关键概念、典型应用场景。
+下面是该范围按书内顺序排列的全部内容（可能较长）。请根据用户的具体问题：
+1. 如果用户问"是什么/讲什么/主要内容"：用结构化方式总结的核心主题、关键概念、典型应用场景。
 2. 如果用户问某个具体概念：定位到相关片段，直接回答并标注引用 [N]。
 3. 回答用中文，分点呈现时使用 markdown，每条 200-400 字。
 
@@ -685,13 +770,14 @@ def api_sessions_list():
 @app.route("/api/sessions", methods=["POST"])
 def api_sessions_create():
     """新建空会话（不立即提问）。"""
-    sid = get_or_create_session(None)
+    data = _parse_json_body()
+    sid = get_or_create_session(None, book=data.get("book") or None)
     return jsonify({"session_id": sid})
 
 
 @app.route("/api/sessions/<sid>/rename", methods=["POST"])
 def api_sessions_rename(sid):
-    data = request.get_json(silent=True) or {}
+    data = _parse_json_body()
     rename_session(sid, data.get("title", ""))
     return jsonify({"ok": True})
 
@@ -704,30 +790,48 @@ def api_sessions_delete(sid):
 
 @app.route("/api/session/<sid>")
 def api_session(sid):
-    return jsonify({"session_id": sid, "messages": get_messages(sid)})
+    """单个会话：消息 + 标题 + 绑定的书。
 
-
-@app.route("/api/chapter/<int:chapter>")
-def api_chapter(chapter: int):
-    """按需返回 DDIA 指定章完整 markdown（前端 marked 渲染）。
-
-    用于"点击引用 → 展开整章"功能，避免启动时预加载所有章。
+    title 必须返回 —— 前端切换/刷新会话时靠它显示会话名，
+    漏了会导致"重命名后刷新就没了"。
     """
-    if chapter < 1 or chapter > 14:
-        return jsonify({"error": f"DDIA 共 14 章，没有第{chapter}章"}), 404
-    md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "books", "ddia", "content", "zh", f"ch{chapter}.md")
-    if not os.path.exists(md_path):
-        return jsonify({"error": f"章节文件不存在: ch{chapter}.md"}), 404
-    with open(md_path, "r", encoding="utf-8") as f:
+    with _db() as c:
+        row = c.execute("SELECT title, book FROM sessions WHERE id=?", (sid,)).fetchone()
+    return jsonify({
+        "session_id": sid,
+        "messages": get_messages(sid),
+        "title": (row["title"] if row else "") or "新对话",
+        "book": (row["book"] if row else "") or "",
+    })
+
+
+@app.route("/api/chapter/<book_id>/<path:rel>")
+def api_source(book_id: str, rel: str):
+    """按需返回某本书里某个源文件的 markdown（前端 marked 渲染）。
+
+    用于"点击引用 → 展开原文"功能。路径只允许读 books/<book_id>/ 之内。
+    """
+    try:
+        books_mod.get_book(book_id)
+    except books_mod.BookError as e:
+        return jsonify({"error": str(e)}), 404
+    # rel 形如 "content/zh/ch3.md" 或 "notes/算法 - 排序.md"
+    rel = rel.split("#")[0]                     # 去掉锚点
+    base = os.path.realpath(os.path.join(books_mod.BOOKS_DIR, book_id))
+    target = os.path.realpath(os.path.join(base, rel))
+    if not target.startswith(base + os.sep) or not os.path.exists(target):
+        return jsonify({"error": f"文件不存在: {rel}"}), 404
+    with open(target, "r", encoding="utf-8") as f:
         md_content = f.read()
-    # 算每节标题的锚 id（前端跳锚用）
-    return jsonify({"chapter": chapter, "markdown": md_content})
+    # 剥掉 YAML frontmatter —— 否则渲染出来是一堆 "title: 事务" 的元数据行，不是正文
+    md_content = re.sub(r"^---\s*\n.*?\n---\s*\n", "", md_content, count=1, flags=re.S)
+    return jsonify({"book": book_id, "source": rel, "markdown": md_content})
 
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "model_loaded": _model is not None, "db": DB_PATH})
+    return jsonify({"ok": True, "model_loaded": _model is not None, "db": DB_PATH,
+                    "books": [b["id"] for b in books_mod.list_books()]})
 
 
 # ---------- 前端 HTML ----------
@@ -735,140 +839,329 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>RAG on Book · DDIA 问答</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RAG on Book · 读书问答</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
-  :root { --bg:#0f1419; --panel:#1a2028; --line:#2a3441; --fg:#d4dae3; --muted:#7a8694; --accent:#5b9dff; --user:#1e3a5f; --asst:#1f2c3a; --sidebar:#131922; }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; height:100vh; display:flex; }
-  aside { width:240px; background:var(--sidebar); border-right:1px solid var(--line); display:flex; flex-direction:column; flex-shrink:0; }
-  aside .brand { padding:14px 16px; border-bottom:1px solid var(--line); font-weight:600; }
-  aside .newbtn { margin:10px 12px; padding:8px; background:var(--accent); color:#fff; border:none; border-radius:6px; cursor:pointer; font-weight:600; }
-  aside .newbtn:hover { background:#4a8ae8; }
-  aside .list { flex:1; overflow-y:auto; }
-  .sess-item { padding:10px 14px; border-bottom:1px solid var(--line); cursor:pointer; display:flex; align-items:center; gap:8px; }
-  .sess-item:hover { background:#1a2330; }
-  .sess-item.active { background:#1e3a5f; }
-  .sess-item .title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
-  .sess-item .title small { color:var(--muted); font-size:11px; display:block; margin-top:2px; }
-  .sess-item .actions { display:none; gap:4px; }
-  .sess-item:hover .actions, .sess-item.active .actions { display:flex; }
-  .sess-item .actions button { background:transparent; border:0; color:var(--muted); cursor:pointer; padding:2px 4px; font-size:14px; }
-  .sess-item .actions button:hover { color:var(--fg); }
-  aside .empty-list { padding:24px 16px; color:var(--muted); font-size:12px; text-align:center; }
-
-  main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
-  header h1 { font-size:16px; margin:0; font-weight:600; }
-  header .sub { color:var(--muted); font-size:12px; }
-  header .spacer { flex:1; }
-  header .sess-title { color:var(--accent); font-size:13px; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  header .sess-title[contenteditable=true] { background:#0f1419; padding:2px 8px; border-radius:4px; outline:1px solid var(--accent); }
-
-  .chat { flex:1; overflow-y:auto; padding:20px; }
-  .msg { max-width:780px; margin:0 auto 16px; display:flex; gap:10px; align-items:flex-start; }
-  .msg .role { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px; flex-shrink:0; }
-  .msg.user .role { background:var(--user); }
-  .msg.assistant .role { background:var(--asst); }
-  .msg .bubble { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 12px; line-height:1.6; word-wrap:break-word; width:fit-content; max-width:600px; min-height:0; align-self:flex-start; }
-  .msg.user .bubble { background:var(--user); border-color:#2a4a75; white-space:pre-wrap; padding:6px 12px; align-self:flex-end; }
-  .msg .bubble h1, .msg .bubble h2, .msg .bubble h3 { margin:8px 0 6px; line-height:1.3; }
-  .msg .bubble h1 { font-size:18px; }
-  .msg .bubble h2 { font-size:16px; }
-  .msg .bubble h3 { font-size:14px; }
-  .msg .bubble p { margin:4px 0; }
-  .msg .bubble ul, .msg .bubble ol { margin:4px 0; padding-left:22px; }
-  .msg .bubble li { margin:2px 0; }
-  .msg .bubble code { background:#0f1419; padding:1px 5px; border-radius:3px; font-size:12px; }
-  .msg .bubble pre { background:#0f1419; padding:8px 10px; border-radius:4px; overflow-x:auto; }
-  .msg .bubble blockquote { border-left:3px solid var(--accent); padding-left:10px; margin:6px 0; color:var(--muted); }
-  .msg .bubble a { color:var(--accent); }
-  .msg .bubble a.ref { color:#5b9dff; text-decoration:none; padding:1px 3px; border-radius:3px; background:rgba(91,157,255,0.1); font-weight:500; cursor:pointer; }
-  .msg .bubble a.ref:hover { background:rgba(91,157,255,0.25); }
-
-  .hits { margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); font-size:12px; color:var(--muted); }
-  .hits-head { color:var(--muted); margin-bottom:4px; font-size:11px; }
-  .hit-group { margin-bottom:2px; }
-  .hit-group > summary { cursor:pointer; padding:4px 8px; background:#161d26; border-radius:4px; list-style:none; display:flex; justify-content:space-between; align-items:center; font-size:12px; }
-  .hit-group > summary::-webkit-details-marker { display:none; }
-  .hit-group > summary::before { content:'▶ '; color:var(--muted); font-size:10px; transition:transform .15s; display:inline-block; }
-  .hit-group[open] > summary::before { transform:rotate(90deg); }
-  .hit-group .sec-name { color:var(--accent); font-weight:500; }
-  .hit-group .sec-cnt { color:var(--muted); font-size:11px; }
-  .hit { margin:3px 0 0 0; padding:6px 8px; background:#121820; border-radius:4px; scroll-margin-top:8px; transition:background 1.2s ease-out; }
-  .hit.highlight { background:rgba(91,157,255,0.25); }
-  .hit .path { color:var(--accent); }
-  .hit .path .chap-link { color:var(--accent); text-decoration:none; cursor:pointer; padding:1px 4px; border-radius:3px; background:rgba(91,157,255,0.08); margin-left:4px; }
-  .hit .path .chap-link:hover { background:rgba(91,157,255,0.25); }
-  .hit .score { color:#5b9dff; font-weight:500; }
-  .hit .src { color:var(--muted); font-size:11px; margin-top:1px; }
-  .hit .snip { color:#9aa5b3; margin-top:3px; line-height:1.5; }
-
-  .chapter-expand { margin:6px 0 8px; background:#0a0e13; border:1px solid var(--line); border-radius:6px; }
-  .chapter-expand .head { display:flex; justify-content:space-between; align-items:center; padding:6px 12px; background:#161d26; border-bottom:1px solid var(--line); border-radius:6px 6px 0 0; }
-  .chapter-expand .head .title { color:var(--accent); font-size:13px; font-weight:500; }
-  .chapter-expand .head .close { background:transparent; border:0; color:var(--muted); cursor:pointer; font-size:14px; padding:0 4px; }
-  .chapter-expand .head .close:hover { color:var(--fg); }
-  .chapter-expand .body { padding:12px 16px; max-height:60vh; overflow-y:auto; line-height:1.7; }
-  .chapter-expand .body h1, .chapter-expand .body h2, .chapter-expand .body h3, .chapter-expand .body h4 {
-    color:var(--fg); margin:12px 0 6px; padding-top:6px;
+  :root {
+    --bg:#0b0d10; --surface:#12151a; --surface-2:#171b22; --elevated:#1c212a;
+    --line:#242a33; --line-soft:#1e242c;
+    --fg:#e6e9ee; --fg-dim:#9aa4b2; --fg-faint:#6b7686;
+    --accent:#d9a441; --accent-soft:rgba(217,164,65,.12); --accent-line:rgba(217,164,65,.3);
+    --user:#1c2430; --user-line:#2b3644;
+    --ok:#5fb98b; --radius:10px; --radius-sm:7px;
+    --sidebar-w:268px; --toc-w:230px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
   }
-  .chapter-expand .body h1 { font-size:20px; border-bottom:1px solid var(--line); padding-bottom:6px; }
-  .chapter-expand .body h2 { font-size:16px; color:var(--accent); scroll-margin-top:8px; }
-  .chapter-expand .body h3 { font-size:14px; color:#9aa5b3; scroll-margin-top:8px; }
-  .chapter-expand .body h4 { font-size:13px; color:var(--muted); }
-  .chapter-expand .body p { margin:6px 0; }
-  .chapter-expand .body ul, .chapter-expand .body ol { margin:6px 0; padding-left:24px; }
-  .chapter-expand .body blockquote { border-left:3px solid var(--accent); padding-left:10px; margin:8px 0; color:var(--muted); }
-  .chapter-expand .body code { background:#0f1419; padding:1px 5px; border-radius:3px; font-size:12px; }
-  .chapter-expand .body pre { background:#0f1419; padding:8px 10px; border-radius:4px; overflow-x:auto; }
-  .chapter-expand .body a { color:var(--accent); }
-  .chapter-expand .body .highlight-anchor { background:rgba(91,157,255,0.25); padding:2px 4px; border-radius:3px; transition:background 1.5s ease-out; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:var(--font);
+         font-size:14px; line-height:1.6; overflow:hidden; }
 
-  .meta { color:var(--muted); font-size:11px; margin-top:8px; }
+  /* ---------- 布局骨架 ---------- */
+  /* 三列固定：sidebar | toc | main。用 grid-column 显式指定，
+     这样即使 toc 被 display:none 拿掉，main 仍在第 3 列，不会串行换行。
+     （初版用 auto-placement + .with-toc 切列数，toc 一 display:none
+       main 就掉到第二行 —— 主区塌到左上角） */
+  .app { display:grid; grid-template-columns:var(--sidebar-w) var(--toc-w) 1fr; height:100vh; }
+  .app:not(.with-toc) { grid-template-columns:var(--sidebar-w) 0 1fr; }
+  .app:not(.with-toc) .toc { display:none; }
+  .sidebar { grid-column:1; grid-row:1; }
+  .toc { grid-column:2; grid-row:1; }
+  .main { grid-column:3; grid-row:1; }
 
-  footer { border-top:1px solid var(--line); padding:12px 20px; background:var(--panel); }
-  .input-row { max-width:780px; margin:0 auto; display:flex; gap:8px; }
-  textarea { flex:1; background:#0f1419; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px 10px; resize:none; font:inherit; height:60px; }
-  textarea:focus { outline:none; border-color:var(--accent); }
-  .send { background:var(--accent); color:#fff; border:none; padding:0 18px; border-radius:6px; cursor:pointer; font-weight:600; }
-  .send:disabled { background:#3a4a5a; cursor:wait; }
-  .empty { color:var(--muted); text-align:center; margin-top:40px; font-size:14px; }
-  .empty code { background:var(--panel); padding:2px 6px; border-radius:3px; }
+  /* ---------- 左侧：会话栏 ---------- */
+  .sidebar { background:var(--surface); border-right:1px solid var(--line);
+             display:flex; flex-direction:column; min-height:0; }
+  .brand { padding:16px 18px 12px; display:flex; align-items:center; gap:9px; }
+  .brand .mark { width:26px; height:26px; border-radius:7px; display:grid; place-items:center;
+                 background:linear-gradient(135deg,var(--accent),#b8791f); color:#1a1206;
+                 font-weight:700; font-size:13px; letter-spacing:-.5px; }
+  .brand .name { font-weight:600; font-size:14.5px; letter-spacing:.2px; }
+  .brand .ver { font-size:11px; color:var(--fg-faint); }
+
+  .newbtn { margin:4px 14px 12px; padding:8px 12px; background:transparent; color:var(--fg);
+            border:1px solid var(--line); border-radius:var(--radius-sm); cursor:pointer;
+            font-family:inherit; font-size:13px; display:flex; align-items:center; justify-content:center;
+            gap:7px; transition:border-color .15s, background .15s; }
+  .newbtn:hover { border-color:var(--accent-line); background:var(--accent-soft); color:var(--accent); }
+  .newbtn .plus { font-size:15px; line-height:1; }
+
+  .sess-scroll { flex:1; overflow-y:auto; padding-bottom:12px; }
+  .sess-item { padding:9px 14px 9px 16px; cursor:pointer; display:flex; align-items:flex-start; gap:8px;
+               border-left:2px solid transparent; transition:background .12s; }
+  .sess-item:hover { background:var(--surface-2); }
+  .sess-item.active { background:var(--accent-soft); border-left-color:var(--accent); }
+  .sess-item .title { flex:1; min-width:0; font-size:13px; overflow:hidden;
+                      text-overflow:ellipsis; white-space:nowrap; }
+  .sess-item.active .title { color:var(--accent); }
+  .sess-item .meta { font-size:11px; color:var(--fg-faint); margin-top:2px;
+                     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sess-item .actions { display:none; gap:2px; }
+  .sess-item:hover .actions { display:flex; }
+  .sess-item .actions button { background:transparent; border:0; color:var(--fg-faint);
+                               cursor:pointer; padding:2px 4px; font-size:13px; border-radius:4px; }
+  .sess-item .actions button:hover { color:var(--fg); background:var(--elevated); }
+  .empty-list { padding:20px 16px; color:var(--fg-faint); font-size:12px; text-align:center; line-height:1.8; }
+
+  .side-foot { padding:10px 14px; border-top:1px solid var(--line-soft); font-size:11px;
+               color:var(--fg-faint); display:flex; justify-content:space-between; align-items:center; }
+
+  /* ---------- 中间：目录栏 ---------- */
+  .toc { background:var(--bg); border-right:1px solid var(--line); overflow-y:auto; padding:14px 0 24px;
+         display:flex; flex-direction:column; min-height:0; }
+  .toc-head { padding:0 16px 10px; }
+  .toc-head .t { font-size:11px; text-transform:uppercase; letter-spacing:.9px; color:var(--fg-faint); }
+  .toc-item { padding:6px 16px 6px 18px; font-size:12.5px; color:var(--fg-dim); cursor:pointer;
+              border-left:2px solid transparent; display:flex; justify-content:space-between; gap:8px; }
+  .toc-item:hover { color:var(--fg); background:var(--surface); }
+  .toc-item.sub { padding-left:30px; font-size:12px; color:var(--fg-faint); }
+  .toc-item.sub:hover { color:var(--fg-dim); }
+  .toc-item .n { color:var(--fg-faint); font-family:var(--mono); font-size:11px; flex-shrink:0; }
+  .toc-group { padding:12px 16px 4px; font-size:10.5px; text-transform:uppercase;
+               letter-spacing:.9px; color:var(--fg-faint); }
+
+  /* ---------- 右侧：主区 ---------- */
+  .main { display:flex; flex-direction:column; min-width:0; min-height:0; background:var(--bg); }
+  .topbar { padding:11px 20px; border-bottom:1px solid var(--line); display:flex;
+            align-items:center; gap:12px; background:rgba(11,13,16,.85); backdrop-filter:blur(12px); }
+  .book-select { display:flex; align-items:center; gap:8px; }
+  .book-select select { background:var(--surface-2); color:var(--fg); border:1px solid var(--line);
+                        border-radius:var(--radius-sm); padding:5px 9px; font-family:inherit; font-size:13px;
+                        cursor:pointer; outline:none; max-width:280px; }
+  .book-select select:focus { border-color:var(--accent-line); }
+  .book-meta { font-size:11.5px; color:var(--fg-faint); }
+  .topbar .spacer { flex:1; }
+  .sess-title { color:var(--fg-dim); font-size:13px; max-width:320px; overflow:hidden;
+                text-overflow:ellipsis; white-space:nowrap; cursor:text; padding:3px 8px;
+                border-radius:5px; border:1px solid transparent; }
+  .sess-title:hover { border-color:var(--line); }
+  .sess-title[contenteditable=true] { background:var(--surface-2); border-color:var(--accent-line);
+                                      outline:none; color:var(--fg); }
+  .toc-toggle { display:none; background:transparent; border:1px solid var(--line); color:var(--fg-dim);
+                border-radius:var(--radius-sm); padding:5px 9px; cursor:pointer; font-size:13px; }
+
+  /* ---------- 消息流 ---------- */
+  .chat { flex:1; overflow-y:auto; padding:24px 20px 8px; }
+  .thread { max-width:820px; margin:0 auto; }
+  .msg { margin-bottom:22px; display:flex; gap:12px; }
+  .msg .avatar { width:26px; height:26px; border-radius:7px; flex-shrink:0; display:grid; place-items:center;
+                 font-size:11px; font-weight:600; margin-top:1px; }
+  .msg.user .avatar { background:var(--user); color:var(--fg-dim); border:1px solid var(--user-line); }
+  .msg.assistant .avatar { background:linear-gradient(135deg,var(--accent),#b8791f); color:#1a1206; }
+  .msg .body { flex:1; min-width:0; }
+  .msg.user .body { background:var(--user); border:1px solid var(--user-line); border-radius:var(--radius);
+                    padding:9px 13px; white-space:pre-wrap; display:inline-block; max-width:100%; }
+  .msg.assistant .body { font-size:14.2px; }
+  .msg .body h1, .msg .body h2, .msg .body h3 { margin:14px 0 7px; line-height:1.35; font-weight:600; }
+  .msg .body h1 { font-size:18px; } .msg .body h2 { font-size:16px; } .msg .body h3 { font-size:14.5px; }
+  .msg .body p { margin:7px 0; }
+  .msg .body ul, .msg .body ol { margin:7px 0; padding-left:20px; }
+  .msg .body li { margin:3px 0; }
+  .msg .body code { background:var(--surface-2); padding:1.5px 5px; border-radius:4px;
+                    font-family:var(--mono); font-size:12.5px; color:#e8c789; }
+  .msg .body pre { background:var(--surface); border:1px solid var(--line-soft); padding:11px 13px;
+                   border-radius:var(--radius-sm); overflow-x:auto; }
+  .msg .body pre code { background:transparent; padding:0; color:var(--fg); }
+  .msg .body blockquote { border-left:2px solid var(--accent-line); padding:2px 0 2px 12px;
+                          margin:9px 0; color:var(--fg-dim); }
+  .msg .body a { color:var(--accent); }
+  .msg .body a.ref { text-decoration:none; padding:1px 4px; border-radius:4px; font-weight:500;
+                     background:var(--accent-soft); color:var(--accent); cursor:pointer; font-size:12.5px; }
+  .msg .body a.ref:hover { background:var(--accent-line); }
+
+  /* ---------- 引用区 ---------- */
+  .hits { margin-top:14px; border-top:1px solid var(--line-soft); padding-top:10px; }
+  .hits-head { color:var(--fg-faint); font-size:11px; margin-bottom:6px;
+               display:flex; align-items:center; gap:6px; }
+  .hit-group { margin-bottom:5px; }
+  .hit-group > summary { cursor:pointer; padding:6px 10px; background:var(--surface);
+                         border:1px solid var(--line-soft); border-radius:var(--radius-sm);
+                         list-style:none; display:flex; justify-content:space-between;
+                         align-items:center; gap:10px; font-size:12.5px; }
+  .hit-group > summary::-webkit-details-marker { display:none; }
+  .hit-group > summary::before { content:'▸'; color:var(--fg-faint); font-size:10px;
+                                 transition:transform .15s; display:inline-block; margin-right:2px; }
+  .hit-group[open] > summary::before { transform:rotate(90deg); }
+  .hit-group .sec-name { color:var(--fg-dim); font-weight:500; }
+  .hit-group .sec-cnt { color:var(--fg-faint); font-size:11px; font-family:var(--mono); flex-shrink:0; }
+  .hit { margin:4px 0 0; padding:9px 11px; background:var(--surface); border:1px solid var(--line-soft);
+         border-radius:var(--radius-sm); scroll-margin-top:20px; transition:background 1.4s ease-out; }
+  .hit.highlight { background:var(--accent-soft); border-color:var(--accent-line); }
+  .hit .path { color:var(--fg-dim); font-size:12.5px; display:flex; flex-wrap:wrap; align-items:center; gap:7px; }
+  .hit .path .idx { color:var(--accent); font-family:var(--mono); font-size:11px; }
+  .hit .path .score { color:var(--fg-faint); font-family:var(--mono); font-size:11px; }
+  .hit .src-btn { color:var(--fg-faint); text-decoration:none; font-size:11.5px; padding:1px 6px;
+                  border:1px solid var(--line); border-radius:4px; cursor:pointer; }
+  .hit .src-btn:hover { color:var(--accent); border-color:var(--accent-line); }
+  .hit .snip { color:var(--fg-dim); margin-top:5px; line-height:1.65; font-size:13px; }
+  .hit .snip p { margin:3px 0; }
+
+  .meta { color:var(--fg-faint); font-size:11px; margin-top:9px; font-family:var(--mono); }
+
+  /* ---------- 原文抽屉 ---------- */
+  .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); opacity:0; pointer-events:none;
+                     transition:opacity .22s; z-index:40; }
+  .drawer-backdrop.open { opacity:1; pointer-events:auto; }
+  .drawer { position:fixed; top:0; right:0; height:100vh; width:min(720px,92vw);
+            background:var(--surface); border-left:1px solid var(--line); z-index:41;
+            transform:translateX(100%); transition:transform .24s cubic-bezier(.4,0,.2,1);
+            display:flex; flex-direction:column; }
+  .drawer.open { transform:translateX(0); }
+  .drawer-head { padding:13px 18px; border-bottom:1px solid var(--line); display:flex;
+                 align-items:center; gap:10px; flex-shrink:0; }
+  .drawer-head .t { font-size:13.5px; font-weight:600; flex:1; min-width:0; overflow:hidden;
+                    text-overflow:ellipsis; white-space:nowrap; }
+  .drawer-head .close { background:transparent; border:0; color:var(--fg-faint); cursor:pointer;
+                        font-size:17px; padding:2px 6px; border-radius:5px; }
+  .drawer-head .close:hover { color:var(--fg); background:var(--surface-2); }
+  .drawer-body { flex:1; overflow-y:auto; padding:18px 22px 40px; line-height:1.75; font-size:14px; }
+  .drawer-body h1 { font-size:20px; margin:16px 0 9px; padding-bottom:7px; border-bottom:1px solid var(--line); }
+  .drawer-body h2 { font-size:16px; color:var(--accent); margin:16px 0 7px; }
+  .drawer-body h3 { font-size:14px; color:var(--fg-dim); margin:13px 0 6px; }
+  .drawer-body p { margin:7px 0; }
+  .drawer-body ul, .drawer-body ol { margin:7px 0; padding-left:22px; }
+  .drawer-body code { background:var(--surface-2); padding:1.5px 5px; border-radius:4px;
+                      font-family:var(--mono); font-size:12.5px; color:#e8c789; }
+  .drawer-body pre { background:var(--bg); border:1px solid var(--line-soft); padding:11px 13px;
+                     border-radius:var(--radius-sm); overflow-x:auto; }
+  .drawer-body pre code { background:transparent; padding:0; color:var(--fg); }
+  .drawer-body blockquote { border-left:2px solid var(--accent-line); padding-left:12px;
+                            margin:9px 0; color:var(--fg-dim); }
+  .drawer-body img { max-width:100%; border-radius:6px; }
+  .drawer-body .highlight-anchor { background:var(--accent-soft); border-radius:4px; padding:1px 3px; }
+
+  /* ---------- 输入区 ---------- */
+  .composer { border-top:1px solid var(--line); padding:14px 20px 16px; background:var(--surface); }
+  .input-wrap { max-width:820px; margin:0 auto; position:relative; }
+  .input-row { display:flex; gap:9px; align-items:flex-end; }
+  textarea { flex:1; background:var(--bg); color:var(--fg); border:1px solid var(--line);
+            border-radius:var(--radius); padding:10px 13px; resize:none; font-family:inherit;
+            font-size:14px; line-height:1.55; min-height:44px; max-height:180px; outline:none;
+            transition:border-color .15s; }
+  textarea:focus { border-color:var(--accent-line); }
+  textarea::placeholder { color:var(--fg-faint); }
+  .send { background:var(--accent); color:#1a1206; border:0; padding:0 18px; height:44px;
+          border-radius:var(--radius); cursor:pointer; font-family:inherit; font-size:13.5px;
+          font-weight:600; flex-shrink:0; transition:opacity .15s; }
+  .send:disabled { opacity:.45; cursor:wait; }
+  .hint { max-width:820px; margin:7px auto 0; font-size:11px; color:var(--fg-faint);
+          display:flex; justify-content:space-between; gap:10px; }
+
+  /* ---------- 空状态 ---------- */
+  .empty { max-width:640px; margin:8vh auto 0; text-align:center; }
+  .empty .eyebrow { font-size:11px; text-transform:uppercase; letter-spacing:1.4px;
+                    color:var(--fg-faint); margin-bottom:14px; }
+  .empty h2 { font-size:24px; font-weight:600; margin:0 0 8px; letter-spacing:-.3px; }
+  .empty p { color:var(--fg-dim); font-size:13.5px; margin:0 0 26px; }
+  .suggest { display:grid; gap:8px; text-align:left; }
+  .suggest button { background:var(--surface); border:1px solid var(--line-soft); color:var(--fg-dim);
+                    padding:11px 14px; border-radius:var(--radius-sm); cursor:pointer;
+                    font-family:inherit; font-size:13px; text-align:left; transition:all .15s;
+                    display:flex; align-items:center; gap:10px; }
+  .suggest button:hover { border-color:var(--accent-line); color:var(--fg); background:var(--surface-2); }
+  .suggest button .arrow { color:var(--fg-faint); font-size:12px; }
+
+  /* ---------- 滚动条 ---------- */
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:#2a313b; border-radius:5px; border:2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background:#39424f; }
+
+  /* ---------- 响应式 ---------- */
+  @media (max-width:1180px) {
+    .app, .app.with-toc { grid-template-columns:var(--sidebar-w) 0 1fr; }
+    .app .toc { display:none; }
+    .app .toc.open { display:flex; position:fixed; top:0; bottom:0; left:var(--sidebar-w);
+                     width:var(--toc-w); z-index:30; box-shadow:8px 0 30px rgba(0,0,0,.4); }
+    .toc-toggle { display:block; }
+  }
+  @media (max-width:820px) {
+    :root { --sidebar-w:0px; --toc-w:0px; }
+    .app, .app.with-toc { grid-template-columns:1fr; }
+    .app .sidebar { grid-column:1; }
+    .app .toc { grid-column:1; }
+    .app .main { grid-column:1; }
+    .sidebar { position:fixed; top:0; bottom:0; left:0; width:270px; z-index:35;
+               transform:translateX(-100%); transition:transform .22s; }
+    .sidebar.open { transform:translateX(0); box-shadow:8px 0 30px rgba(0,0,0,.5); }
+    .menu-btn { display:block !important; }
+    .app .toc.open { left:0; width:min(280px,85vw); }
+    .chat { padding:16px 14px 8px; }
+    .composer { padding:11px 14px 13px; }
+    .drawer { width:100vw; }
+    .topbar { padding:10px 14px; gap:8px; }
+    .sess-title { max-width:140px; }
+    .book-select select { max-width:170px; }
+  }
+  .menu-btn { display:none; background:transparent; border:1px solid var(--line); color:var(--fg-dim);
+              border-radius:var(--radius-sm); padding:5px 9px; cursor:pointer; font-size:13px; }
+  .scrim { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:34; display:none; }
+  .scrim.open { display:block; }
 </style>
 </head>
 <body>
 
-<aside>
-  <div class="brand">📚 RAG on Book</div>
-  <button class="newbtn" onclick="newChat()">+ 新对话</button>
-  <div class="list" id="sessList"></div>
-</aside>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="mark">R</div>
+      <div>
+        <div class="name">RAG on Book</div>
+        <div class="ver">读书问答 · 本地检索</div>
+      </div>
+    </div>
+    <button class="newbtn" onclick="newChat()"><span class="plus">＋</span> 新对话</button>
+    <div class="sess-scroll"><div id="sessList"></div></div>
+    <div class="side-foot">
+      <span id="bookCount"></span>
+      <span id="vecInfo"></span>
+    </div>
+  </aside>
 
-<main>
-  <header>
-    <h1>DDIA 问答</h1>
-    <span class="sub" id="sessId"></span>
-    <span class="spacer"></span>
-    <span class="sess-title" id="sessTitle" title="双击重命名">新对话</span>
-  </header>
-  <div class="chat" id="msgs">
-    <div class="empty">
-      试着问：<br><br>
-      <code>DDIA 里事务隔离级别有哪些？</code><br>
-      <code>LSM 树和 B+ 树的区别？</code><br>
-      <code>两阶段提交有什么问题？</code><br>
-      <code>第一章有哪些内容？</code>
+  <nav class="toc" id="toc">
+    <div class="toc-head"><div class="t" id="tocTitle">目录</div></div>
+    <div id="tocList"></div>
+  </nav>
+
+  <main class="main">
+    <div class="topbar">
+      <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+      <div class="book-select">
+        <select id="bookSel" onchange="onBookChange(this.value)"></select>
+      </div>
+      <span class="book-meta" id="bookMeta"></span>
+      <button class="toc-toggle" onclick="toggleToc()">目录</button>
+      <span class="spacer"></span>
+      <span class="sess-title" id="sessTitle" title="点击重命名">新对话</span>
     </div>
+    <div class="chat" id="msgs"></div>
+    <div class="composer">
+      <div class="input-wrap">
+        <div class="input-row">
+          <textarea id="q" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）" autofocus></textarea>
+          <button class="send" id="btn" onclick="send()">发送</button>
+        </div>
+        <div class="hint">
+          <span id="hintLeft"></span>
+          <span>Enter 发送 · Shift+Enter 换行</span>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim" onclick="closeMobile()"></div>
+<div class="drawer-backdrop" id="drawerBg" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="t" id="drawerTitle">原文</span>
+    <button class="close" onclick="closeDrawer()">✕</button>
   </div>
-  <footer>
-    <div class="input-row">
-      <textarea id="q" placeholder="输入问题，Enter 发送，Shift+Enter 换行" autofocus></textarea>
-      <button class="send" id="btn" onclick="send()">发送</button>
-    </div>
-  </footer>
-</main>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
 
 <script>
 if (window.marked) {
@@ -883,74 +1176,132 @@ function md(text) {
 function linkifyRefs(html) {
   return html.replace(/\[(\d{1,2})\]/g, (m, n) => `<a href="#ref-${n}" class="ref" data-ref="${n}">[${n}]</a>`);
 }
-
-// ===== 章节缓存（key: chapter 数字 → 渲染好的 HTML + 锚点字典）=====
-const chapterCache = {};  // ch -> { html, anchorMap }
-
-// 把 markdown 的 heading 加上自定义 anchor id（slug 化中文）
-function slugifyHeading(s) {
-  // 简单中文 slug：保留汉字 + 拉丁字母数字，转 - ；md 本身已 headerIds 自动生成，
-  // 我们只额外确保唯一
-  return s.replace(/[^\w\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '');
+function escape(s) {
+  return String(s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 }
 
-// 从 heading_path（如"第8章 事务 > 弱隔离级别 > 读已提交"）抽出
-// chapter（数字）和 target anchor（用于跳到该节）
-function parseHeadingPath(hp) {
-  const m = (hp || '').match(/第\s*(\d+)\s*章/);
-  const chapter = m ? m[1] : null;
-  // 跳过"第N章 ... "，剩下是层级路径，用 > 分隔
-  const parts = (hp || '').split(' > ');
-  const sectionPath = parts.slice(1).join(' > ');  // 去掉章
-  return { chapter, sectionPath, full: hp || '' };
-}
-
-async function loadChapter(chNum) {
-  if (chapterCache[chNum]) return chapterCache[chNum];
-  const r = await fetch(`/t/ragbook/api/chapter/${chNum}`);
-  if (!r.ok) {
-    const d = await r.json().catch(() => ({}));
-    throw new Error(d.error || `HTTP ${r.status}`);
-  }
-  const d = await r.json();
-  // marked 已给 heading 生成 id（headerPrefix: 'h-'），渲染完拿到 DOM 提取
-  const wrapper = document.createElement('div');
-  wrapper.innerHTML = md(d.markdown);
-  // 收集 heading id 映射（h.text → h.id），用于定位
-  const anchorMap = {};
-  wrapper.querySelectorAll('h1, h2, h3, h4').forEach(h => {
-    if (h.id) anchorMap[h.textContent.trim()] = h.id;
-  });
-  chapterCache[chNum] = { html: wrapper.innerHTML, anchorMap, title: wrapper.querySelector('h1')?.textContent || `第${chNum}章` };
-  return chapterCache[chNum];
-}
-
-// 找到最匹配的 anchor（精确 > 包含 > 第一章/章引言兜底）
-function findAnchor(chapterData, sectionPath) {
-  const m = chapterData.anchorMap;
-  if (!sectionPath) return null;
-  // 精确匹配
-  if (m[sectionPath]) return m[sectionPath];
-  // 包含匹配
-  for (const [text, id] of Object.entries(m)) {
-    if (sectionPath.includes(text) || text.includes(sectionPath)) return id;
-  }
-  return null;
-}
-
+// ===== 全局状态 =====
 let SID = localStorage.getItem('ragbook_sid') || null;
+let BOOKS = [];
+let BOOK = localStorage.getItem('ragbook_book') || null;
+let OUTLINE = {kind:'topic', items:[]};
 const $list = document.getElementById('sessList');
 const $msgs = document.getElementById('msgs');
 const $q = document.getElementById('q');
 const $btn = document.getElementById('btn');
 const $title = document.getElementById('sessTitle');
-const $sessId = document.getElementById('sessId');
+const $bookSel = document.getElementById('bookSel');
+const $bookMeta = document.getElementById('bookMeta');
+const $tocList = document.getElementById('tocList');
+const $tocTitle = document.getElementById('tocTitle');
+const $drawer = document.getElementById('drawer');
+const $drawerBody = document.getElementById('drawerBody');
+const $drawerTitle = document.getElementById('drawerTitle');
+const $drawerBg = document.getElementById('drawerBg');
 
-$title.addEventListener('dblclick', () => {
+function currentBook() { return BOOKS.find(b => b.id === BOOK) || null; }
+
+// ===== 书清单 =====
+async function loadBooks() {
+  const r = await fetch('/t/ragbook/api/books');
+  const d = await r.json();
+  BOOKS = d.books || [];
+  if (!BOOKS.length) {
+    $bookSel.innerHTML = '<option>暂无书目</option>';
+    return;
+  }
+  if (!BOOK || !BOOKS.some(b => b.id === BOOK)) {
+    const first = BOOKS.find(b => b.chunk_count) || BOOKS[0];
+    BOOK = first.id;
+    localStorage.setItem('ragbook_book', BOOK);
+  }
+  $bookSel.innerHTML = BOOKS.map(b =>
+    `<option value="${b.id}"${b.id===BOOK?' selected':''}>${escape(b.title)}</option>`).join('');
+  document.getElementById('bookCount').textContent = BOOKS.length + ' 本书';
+  applyBook();
+}
+
+function applyBook() {
+  const b = currentBook();
+  if (!b) return;
+  OUTLINE = b.outline || {kind:'topic', items:[]};
+  $bookMeta.textContent = [b.author, b.chunk_count ? (b.chunk_count + ' 块') : '未建索引'].filter(Boolean).join(' · ');
+  document.getElementById('vecInfo').textContent = '';
+  localStorage.setItem('ragbook_book', BOOK);
+  renderOutline();
+  renderEmpty();
+  $q.placeholder = b.meta_kind === 'chapter'
+    ? '问点什么…（如「第8章讲什么」「弱隔离级别有哪些」）'
+    : '问点什么…（如「快排怎么写」「TCP 三次握手为什么是三次」）';
+}
+
+function onBookChange(v) {
+  BOOK = v;
+  applyBook();
+  // 切书 = 新话题，清空当前会话视图（后端会话保留）
+  SID = null;
+  localStorage.removeItem('ragbook_sid');
+  loadSessions();
+  $msgs.innerHTML = '';
+  $title.textContent = '新对话';
+  renderEmpty();
+}
+
+function renderOutline() {
+  const items = OUTLINE.items || [];
+  const app = document.getElementById('app');
+  if (items.length) app.classList.add('with-toc'); else app.classList.remove('with-toc');
+  if (OUTLINE.kind === 'chapter') {
+    $tocTitle.textContent = '章节';
+    $tocList.innerHTML = items.map(it => {
+      const subs = (it.sections || []).map(s =>
+        `<div class="toc-item sub" onclick="askAbout('第${escape(it.key)}章 ${escape(it.title)}')">${escape(s)}</div>`).join('');
+      return `<div class="toc-item" onclick="askAbout('第${escape(it.key)}章 ${escape(it.title)}')">
+                <span>${escape(it.key)} · ${escape(it.title)}</span></div>${subs}`;
+    }).join('');
+  } else {
+    $tocTitle.textContent = '主题';
+    // files 元素是 {name, topic} 对象（parse.py 生成的），取 name 展示、topic 提问
+    const fname = f => (f && typeof f === 'object') ? (f.name || '') : String(f || '');
+    const ftopic = f => (f && typeof f === 'object') ? (f.topic || f.name || '') : String(f || '');
+    $tocList.innerHTML = items.map(it => {
+      const files = (it.files || []).map(f =>
+        `<div class="toc-item sub" onclick="askAbout('${escape(ftopic(f)).replace(/'/g, "\\'")}')">${escape(fname(f))}</div>`).join('');
+      return `<div class="toc-group">${escape(it.title)}</div>
+              <div class="toc-item" onclick="askAbout('${escape(it.title).replace(/'/g, "\\'")}')"><span>${escape(it.title)}</span>
+                <span class="n">${(it.files||[]).length}</span></div>${files}`;
+    }).join('');
+  }
+}
+
+function askAbout(text) {
+  $q.value = text;
+  $q.focus();
+  send();
+}
+
+function renderEmpty() {
+  const b = currentBook();
+  if (!b) { $msgs.innerHTML = '<div class="empty"><h2>还没有可用的书</h2><p>先跑 parse.py + index.py 建索引</p></div>'; return; }
+  const sug = b.meta_kind === 'chapter'
+    ? ['第8章讲了什么？', '弱隔离级别有哪些？', '两阶段提交有什么问题？', 'LSM 树和 B+ 树的区别？']
+    : ['快速排序怎么实现？', 'TCP 三次握手为什么是三次？', 'B+ 树索引的原理？', 'MySQL 索引为什么用 B+ 树？'];
+  $msgs.innerHTML = `<div class="empty">
+    <div class="eyebrow">${escape(b.subtitle || b.title)}</div>
+    <h2>${escape(b.title)}</h2>
+    <p>${escape(b.author || '')}${b.author ? ' · ' : ''}全部内容已建索引，问点具体的</p>
+    <div class="suggest">${sug.map(s =>
+      `<button onclick="askAbout('${escape(s).replace(/'/g, "\\'")}')"><span>${escape(s)}</span><span class="arrow">→</span></button>`).join('')}</div>
+  </div>`;
+}
+
+// ===== 会话 =====
+$title.addEventListener('click', () => {
   const old = $title.textContent;
   $title.contentEditable = 'true';
   $title.focus();
-  const r = document.createRange(); r.selectNodeContents($title); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  const r = document.createRange(); r.selectNodeContents($title);
+  const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
   const finish = () => {
     $title.contentEditable = 'false';
     $title.removeEventListener('blur', finish);
@@ -964,7 +1315,8 @@ $title.addEventListener('dblclick', () => {
       }).then(() => loadSessions());
     }
   };
-  const onKey = e => { if (e.key === 'Enter') { e.preventDefault(); $title.blur(); } if (e.key === 'Escape') { $title.textContent = old; $title.blur(); } };
+  const onKey = e => { if (e.key === 'Enter') { e.preventDefault(); $title.blur(); }
+                      if (e.key === 'Escape') { $title.textContent = old; $title.blur(); } };
   $title.addEventListener('blur', finish);
   $title.addEventListener('keydown', onKey);
 });
@@ -972,13 +1324,17 @@ $title.addEventListener('dblclick', () => {
 $q.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
+$q.addEventListener('input', () => {
+  $q.style.height = 'auto';
+  $q.style.height = Math.min($q.scrollHeight, 180) + 'px';
+});
 
 async function loadSessions() {
   const r = await fetch('/t/ragbook/api/sessions');
   const d = await r.json();
   $list.innerHTML = '';
   if (!d.sessions.length) {
-    $list.innerHTML = '<div class="empty-list">还没有对话<br>点"+ 新对话"开始</div>';
+    $list.innerHTML = '<div class="empty-list">还没有对话<br>点「＋ 新对话」开始</div>';
     return;
   }
   d.sessions.forEach(s => {
@@ -987,16 +1343,16 @@ async function loadSessions() {
     div.dataset.sid = s.id;
     const preview = s.first_q ? s.first_q.slice(0, 30) : '空对话';
     const ago = relTime(s.updated_at);
+    const bookTag = s.book ? (BOOKS.find(b=>b.id===s.book)?.title || s.book) : '';
     div.innerHTML = `
       <div class="title">
         <div>${escape(s.title)}</div>
-        <small>${escape(preview)} · ${ago}</small>
+        <div class="meta">${escape(bookTag ? bookTag + ' · ' : '')}${escape(preview)} · ${ago}</div>
       </div>
       <div class="actions">
-        <button onclick="renameInline(event,'${s.id}')" title="重命名">✏️</button>
+        <button onclick="renameInline(event,'${s.id}')" title="重命名">✎</button>
         <button onclick="delSession(event,'${s.id}')" title="删除">🗑</button>
-      </div>
-    `;
+      </div>`;
     div.onclick = e => {
       if (e.target.closest('.actions')) return;
       switchSession(s.id);
@@ -1019,7 +1375,7 @@ async function loadSession(sid) {
   const d = await r.json();
   $msgs.innerHTML = '';
   if (!d.messages.length) {
-    $msgs.innerHTML = '<div class="empty">开始你的第一个问题 ↓</div>';
+    renderEmpty();
   } else {
     d.messages.forEach(m => {
       if (m.role === 'user') appendMsg('user', m.content);
@@ -1036,12 +1392,15 @@ async function switchSession(sid) {
   const r = await fetch('/t/ragbook/api/session/' + sid);
   const d = await r.json();
   $title.textContent = d.title || '新对话';
-  $sessId.textContent = sid.slice(0,8);
+  if (d.book && d.book !== BOOK) { BOOK = d.book; $bookSel.value = BOOK; applyBook(); }
   await loadSession(sid);
 }
 
 async function newChat() {
-  const r = await fetch('/t/ragbook/api/sessions', {method:'POST'});
+  const r = await fetch('/t/ragbook/api/sessions', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({book: BOOK})
+  });
   const d = await r.json();
   SID = d.session_id;
   localStorage.setItem('ragbook_sid', SID);
@@ -1072,9 +1431,9 @@ async function delSession(ev, sid) {
   if (sid === SID) {
     SID = null;
     localStorage.removeItem('ragbook_sid');
-    $msgs.innerHTML = '<div class="empty">点"+ 新对话"开始</div>';
+    $msgs.innerHTML = '';
     $title.textContent = '新对话';
-    $sessId.textContent = '';
+    renderEmpty();
   }
   await loadSessions();
 }
@@ -1083,24 +1442,27 @@ async function send() {
   const q = $q.value.trim();
   if (!q) return;
   if (!SID) {
-    const r = await fetch('/t/ragbook/api/sessions', {method:'POST'});
+    const r = await fetch('/t/ragbook/api/sessions', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({book: BOOK})
+    });
     SID = (await r.json()).session_id;
   }
   $btn.disabled = true;
   $q.value = '';
+  $q.style.height = 'auto';
   removeEmpty();
   appendMsg('user', q);
   const placeholder = appendMsg('assistant', '正在检索 + 生成回答…');
 
   const ctrl = new AbortController();
-  const guard = setTimeout(() => ctrl.abort(), 90000);  // LLM 生成上限保护
+  const guard = setTimeout(() => ctrl.abort(), 120000);
   try {
     const r = await fetch('/t/ragbook/api/ask', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ query:q, session_id:SID, top_k:5 }),
+      body: JSON.stringify({ query:q, session_id:SID, top_k:5, book:BOOK }),
       signal: ctrl.signal
     });
-    // 先取文本再判断 JSON：空 body / 网关错误页不会让 json() 抛晦涩异常
     const raw = await r.text();
     let d = null;
     if (raw && (r.headers.get('content-type') || '').includes('application/json')) {
@@ -1108,26 +1470,25 @@ async function send() {
     }
     placeholder.remove();
     if (!d) {
-      // 网关断连 / 截断 / 502 等：回答可能已生成，重拉会话同步
       appendMsg('assistant', `⚠️ 服务响应异常（HTTP ${r.status}）。若回答已生成会自动显示，否则请稍后重试。`);
       try { await loadSession(SID); } catch {}
-      $msgs.scrollTop = $msgs.scrollHeight;
     } else if (d.error) {
       appendMsg('assistant', '⚠️ ' + d.error, d.hits || []);
     } else {
       const intentTag = d.intent ? ` · ${d.intent}[${d.intent_src}]` : '';
-      appendMsg('assistant', d.answer || '（无回答）', d.hits || [], `检索 ${d.search_ms}ms · LLM ${d.llm_ms}ms${intentTag}`);
+      appendMsg('assistant', d.answer || '（无回答）', d.hits || [],
+                `检索 ${d.search_ms}ms · LLM ${d.llm_ms}ms${intentTag}`);
       SID = d.session_id;
       localStorage.setItem('ragbook_sid', SID);
       await loadSessions();
       document.querySelectorAll('.sess-item').forEach(el => el.classList.toggle('active', el.dataset.sid === SID));
       const item = document.querySelector(`.sess-item[data-sid="${SID}"]`);
-      if (item) { $title.textContent = item.querySelector('.title > div').textContent; $sessId.textContent = SID.slice(0,8); }
+      if (item) $title.textContent = item.querySelector('.title > div').textContent;
     }
   } catch (e) {
     placeholder.remove();
     if (e.name === 'AbortError') {
-      appendMsg('assistant', '⏳ 生成超过 90 秒被中断。回答可能仍在生成：请稍等几秒后刷新页面查看，或重新发送问题。');
+      appendMsg('assistant', '⏳ 生成超时被中断。回答可能仍在生成：请稍等几秒刷新查看，或重新发送问题。');
     } else {
       appendMsg('assistant', '⚠️ 网络错误：' + e.message + '。请检查服务是否在线后重试。');
     }
@@ -1142,40 +1503,23 @@ async function send() {
 function appendMsg(role, text, hits, meta) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
-  let bodyHtml;
-  if (role === 'assistant') {
-    bodyHtml = linkifyRefs(md(text || ''));
-  } else {
-    bodyHtml = escape(text || '');
-  }
-  // 注意：模板必须单行紧凑拼接——user 气泡有 white-space:pre-wrap，
-  // 跨行模板的换行/缩进会进入文本节点，把短消息撑成超高气泡
+  const bodyHtml = role === 'assistant' ? linkifyRefs(md(text || '')) : escape(text || '');
   const hitsHtml = hits && hits.length ? renderHits(hits) : '';
   const metaHtml = meta ? `<div class="meta">${meta}</div>` : '';
-  div.innerHTML = `<div class="role">${role==='user'?'你':'书'}</div><div class="bubble">${bodyHtml}${hitsHtml}${metaHtml}</div>`;
-  const bubble = div.querySelector('.bubble');
-  // 引用跳转（LLM 答案里的 [N]）
-  bubble.addEventListener('click', e => {
+  div.innerHTML = `<div class="avatar">${role==='user'?'我':'书'}</div>
+                   <div class="body">${bodyHtml}${hitsHtml}${metaHtml}</div>`;
+  const body = div.querySelector('.body');
+  body.addEventListener('click', e => {
     const a = e.target.closest('a.ref');
-    if (!a) return;
-    e.preventDefault();
-    const n = a.dataset.ref;
-    jumpToRef(n, div);
-  });
-  // 章节展开（每条 hit 里的 📖 章节链接）
-  bubble.addEventListener('click', e => {
-    const link = e.target.closest('.chap-link');
-    if (!link) return;
-    e.preventDefault();
-    e.stopPropagation();
-    openChapter(link, div);
+    if (a) { e.preventDefault(); jumpToRef(a.dataset.ref, div); return; }
+    const src = e.target.closest('.src-btn');
+    if (src) { e.preventDefault(); openSource(src.dataset.book, src.dataset.source, src.dataset.anchor, div); }
   });
   $msgs.appendChild(div);
   $msgs.scrollTop = $msgs.scrollHeight;
   return div;
 }
 
-// 在 hits 区域跳转高亮
 function jumpToRef(n, msgDiv) {
   const target = msgDiv.querySelector(`.hit#ref-${n}`);
   if (!target) return;
@@ -1189,63 +1533,49 @@ function jumpToRef(n, msgDiv) {
   setTimeout(() => target.classList.remove('highlight'), 1500);
 }
 
-// 点击 hit 的章节链接 → 在该 hit 下方展开整章 markdown
-async function openChapter(linkEl, msgDiv) {
-  const hitEl = linkEl.closest('.hit');
-  const chNum = linkEl.dataset.chapter;
-  const sectionPath = linkEl.dataset.section || '';
-  // 同一 hit 已经展开过 → 关闭
-  const existing = hitEl.nextElementSibling;
-  if (existing && existing.classList && existing.classList.contains('chapter-expand') && existing.dataset.chapter === chNum) {
-    existing.remove();
-    linkEl.textContent = '📖 展开本章';
-    return;
-  }
-  linkEl.textContent = '⏳ 加载中…';
+// ===== 原文抽屉 =====
+const sourceCache = {};
+async function openSource(book, source, anchor, msgDiv) {
+  if (!book || !source) return;
+  const key = book + '|' + source;
+  $drawerTitle.textContent = source;
+  $drawerBody.innerHTML = '<div style="color:var(--fg-faint)">加载中…</div>';
+  $drawer.classList.add('open');
+  $drawerBg.classList.add('open');
   try {
-    const data = await loadChapter(chNum);
-    // 删除可能存在的旧展开（不同章节）
-    if (existing && existing.classList && existing.classList.contains('chapter-expand')) {
-      existing.remove();
+    let html = sourceCache[key];
+    if (!html) {
+      const url = '/t/ragbook/api/chapter/' + encodeURIComponent(book) + '/' +
+                  source.split('#')[0].split('/').map(encodeURIComponent).join('/');
+      const r = await fetch(url);
+      const d = await r.json();
+      if (d.error) throw new Error(d.error);
+      html = md(d.markdown);
+      sourceCache[key] = html;
     }
-    const div = document.createElement('div');
-    div.className = 'chapter-expand';
-    div.dataset.chapter = chNum;
-    div.innerHTML = `
-      <div class="head">
-        <span class="title">📖 ${escape(data.title)}</span>
-        <button class="close" title="收起">✕</button>
-      </div>
-      <div class="body">${data.html}</div>
-    `;
-    div.querySelector('.close').onclick = () => {
-      div.remove();
-      linkEl.textContent = '📖 展开本章';
-    };
-    hitEl.after(div);
-    // 跳到指定节
-    const anchor = findAnchor(data, sectionPath);
+    $drawerBody.innerHTML = html;
     if (anchor) {
-      const target = div.querySelector('#' + CSS.escape(anchor));
+      const target = $drawerBody.querySelector('#' + CSS.escape(anchor));
       if (target) {
         target.scrollIntoView({ behavior: 'smooth', block: 'start' });
         target.classList.add('highlight-anchor');
         setTimeout(() => target.classList.remove('highlight-anchor'), 1800);
       }
-    } else {
-      div.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
-    linkEl.textContent = '📕 收起本章';
   } catch (e) {
-    linkEl.textContent = '⚠️ ' + e.message;
+    $drawerBody.innerHTML = '<div style="color:#e08585">加载失败：' + escape(e.message) + '</div>';
   }
+}
+function closeDrawer() {
+  $drawer.classList.remove('open');
+  $drawerBg.classList.remove('open');
 }
 
 function renderHits(hits) {
   const groups = {};
   hits.forEach((h, i) => {
     const parts = (h.heading_path || '').split(' > ');
-    const section = parts.length >= 2 ? parts[1] : parts[0] || '其他';
+    const section = parts.length >= 2 ? parts.slice(0,2).join(' › ') : (parts[0] || '其他');
     if (!groups[section]) groups[section] = { items: [], indices: [] };
     groups[section].items.push(h);
     groups[section].indices.push(i + 1);
@@ -1254,18 +1584,18 @@ function renderHits(hits) {
   let html = `<div class="hits"><div class="hits-head">📎 引用 ${hits.length} 条 · ${sections.length} 节</div>`;
   sections.forEach(sec => {
     const g = groups[sec];
-    const idxRange = g.indices.length === 1 ? `[${g.indices[0]}]` : `[${g.indices[0]}-${g.indices[g.indices.length-1]}]`;
-    html += `<details class="hit-group"><summary><span class="sec-name">${escape(sec)}</span><span class="sec-cnt">${idxRange} ${g.items.length}条</span></summary>`;
+    const idxRange = g.indices.length === 1 ? `[${g.indices[0]}]` : `[${g.indices[0]}–${g.indices[g.indices.length-1]}]`;
+    html += `<details class="hit-group"><summary><span class="sec-name">${escape(sec)}</span><span class="sec-cnt">${idxRange} · ${g.items.length}条</span></summary>`;
     g.items.forEach((h, k) => {
       const origIdx = g.indices[k];
-      const parsed = parseHeadingPath(h.heading_path);
-      const chapBtn = parsed.chapter
-        ? `<a class="chap-link" data-chapter="${parsed.chapter}" data-section="${escape(parsed.sectionPath)}">📖 展开本章</a>`
+      const anchor = (h.source || '').split('#')[1] || '';
+      const srcBtn = h.source
+        ? `<span class="src-btn" data-book="${escape(h.book || BOOK)}" data-source="${escape(h.source)}" data-anchor="${escape(anchor)}">查看原文</span>`
         : '';
       const snipMd = md('…' + (h.snippet || '') + '…');
       html += `<div class="hit" id="ref-${origIdx}">
-        <div class="path">[${origIdx}] ${escape(h.heading_path)} <span class="score">${h.score}%</span>${chapBtn}</div>
-        <div class="src">${escape(h.source)}</div>
+        <div class="path"><span class="idx">[${origIdx}]</span>${escape(h.heading_path)}
+          <span class="score">${h.score}%</span>${srcBtn}</div>
         <div class="snip">${snipMd}</div>
       </div>`;
     });
@@ -1279,20 +1609,30 @@ function removeEmpty() {
   const e = $msgs.querySelector('.empty'); if (e) e.remove();
 }
 
-function escape(s) {
-  return String(s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// ===== 移动端 =====
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('scrim').classList.toggle('open');
+}
+function toggleToc() {
+  document.getElementById('toc').classList.toggle('open');
+  document.getElementById('scrim').classList.toggle('open');
+}
+function closeMobile() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('toc').classList.remove('open');
+  document.getElementById('scrim').classList.remove('open');
 }
 
 (async () => {
+  await loadBooks();
   await loadSessions();
   if (SID) {
     const item = document.querySelector(`.sess-item[data-sid="${SID}"]`);
-    if (item) {
-      switchSession(SID);
-    } else {
-      SID = null;
-      localStorage.removeItem('ragbook_sid');
-    }
+    if (item) await switchSession(SID);
+    else { SID = null; localStorage.removeItem('ragbook_sid'); renderEmpty(); }
+  } else {
+    renderEmpty();
   }
 })();
 </script>

@@ -1,0 +1,98 @@
+{
+  "id": "cs-notes",
+  "title": "CS-Notes",
+  "subtitle": "计算机面试必备基础知识",
+  "author": "CyC2018",
+  "kind": "note_set",
+  "source_dir": "notes",
+  "skip_files": [
+    "*目录*"
+  ],
+  "meta": {
+    "kind": "topic",
+    "groups": [
+      {
+        "name": "算法",
+        "patterns": [
+          "算法*",
+          "Leetcode*",
+          "LeetCode*",
+          "剑指*",
+          "[0-9]*"
+        ]
+      },
+      {
+        "name": "计算机网络",
+        "patterns": [
+          "计算机网络*"
+        ]
+      },
+      {
+        "name": "操作系统",
+        "patterns": [
+          "计算机操作系统*"
+        ]
+      },
+      {
+        "name": "数据库",
+        "patterns": [
+          "MySQL*",
+          "Redis*",
+          "SQL*",
+          "数据库系统原理*",
+          "Elasticsearch*"
+        ]
+      },
+      {
+        "name": "中间件",
+        "patterns": [
+          "缓存*",
+          "消息队列*",
+          "RabbitMQ*",
+          "Kafka*"
+        ]
+      },
+      {
+        "name": "Java",
+        "patterns": [
+          "Java*",
+          "Spring*"
+        ]
+      },
+      {
+        "name": "系统设计",
+        "patterns": [
+          "系统设计*",
+          "分布式*",
+          "微服务*",
+          "集群*",
+          "面向对象*",
+          "设计模式*"
+        ]
+      },
+      {
+        "name": "大模型应用",
+        "patterns": [
+          "大模型应用*"
+        ]
+      },
+      {
+        "name": "网络与工具",
+        "patterns": [
+          "HTTP*",
+          "Socket*",
+          "Linux*",
+          "Docker*",
+          "Git*",
+          "构建工具*"
+        ]
+      },
+      {
+        "name": "其他",
+        "patterns": [
+          "*"
+        ]
+      }
+    ]
+  }
+}

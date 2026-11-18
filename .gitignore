@@ -13,10 +13,24 @@ env/
 # 向量库备份（重建前手动备份用，正式 .vector 保留以避免 clone 后必须重建索引）
 .vector.bak.*/
 
+# Milvus Lite 的 WAL 临时文件（运行中生成，会自动 checkpoint）
+.vector/**/*.db-wal
+.vector/**/wal/
+
 # 会话数据库（运行时生成，含历史问答）
 data/*.db
 data/*.db-shm
 data/*.db-wal
+
+# 解析产物（parse.py 生成，体积大且可复现；outline.json 保留因为 web.py 启动要读目录树）
+books/*/parsed.jsonl
+
+# 每本书自己的向量库（books/<id>/vector/）
+books/*/vector/
+
+# 旧版"多书共库"目录（2026-11-18 一书一库后已废弃，文件保留在本地做备份）
+.vector/
+.vector.bak.*/
 
 # 编辑器
 .vscode/

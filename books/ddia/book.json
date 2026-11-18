@@ -1,0 +1,21 @@
+{
+  "id": "ddia",
+  "title": "设计数据密集型应用",
+  "subtitle": "DDIA · Large-Scale Data Systems",
+  "author": "Martin Kleppmann",
+  "kind": "chapter_book",
+  "source_dir": "content/zh",
+  "skip_files": [
+    "_index.md",
+    "toc.md",
+    "contrib.md",
+    "colophon.md",
+    "indexes.md",
+    "part-i.md",
+    "part-ii.md",
+    "part-iii.md"
+  ],
+  "meta": {
+    "kind": "chapter"
+  }
+}
