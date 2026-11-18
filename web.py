@@ -521,6 +521,9 @@ def api_books():
             "author": b.get("author", ""),
             "kind": b["kind"],
             "meta_kind": b.get("meta", {}).get("kind", ""),
+            # 空状态的推荐问题：优先读 book.json 的 meta.suggestions，
+            # 没配就让前端按目录树自己推导 —— 不再按 meta_kind 硬编 DDIA 那四条（换书就不对了）。
+            "suggestions": b.get("meta", {}).get("suggestions", []),
             "chunk_count": b.get("chunk_count", 0),
             "outline": outline,
         })
@@ -1076,15 +1079,20 @@ INDEX_HTML = r"""<!doctype html>
 
   /* ---------- 响应式 ---------- */
   @media (max-width:1180px) {
-    .app, .app.with-toc { grid-template-columns:var(--sidebar-w) 0 1fr; }
+    /* 三个选择器都写上：基础规则里的 .app:not(.with-toc) 特指 0,2,0，
+       单写 .app（0,1,0）压不住它 —— 列数没切成 1 列，主区就被塞进 grid-column:1 的 0px 列里。*/
+    .app, .app.with-toc, .app:not(.with-toc) { grid-template-columns:var(--sidebar-w) 0 1fr; }
     .app .toc { display:none; }
     .app .toc.open { display:flex; position:fixed; top:0; bottom:0; left:var(--sidebar-w);
-                     width:var(--toc-w); z-index:30; box-shadow:8px 0 30px rgba(0,0,0,.4); }
+                     /* 必须高于 .scrim(34)，否则遮罩盖在目录上，手指滑动全被遮罩吃掉、一碰就关。
+                        与 .sidebar(35) 持平。*/ 
+                     width:var(--toc-w); z-index:35; box-shadow:8px 0 30px rgba(0,0,0,.4); }
     .toc-toggle { display:block; }
   }
   @media (max-width:820px) {
     :root { --sidebar-w:0px; --toc-w:0px; }
-    .app, .app.with-toc { grid-template-columns:1fr; }
+    /* 同 1180 断点：必须同时压住 .app:not(.with-toc)，否则列数切不成 1 列、主区塌成 0 宽。*/
+    .app, .app.with-toc, .app:not(.with-toc) { grid-template-columns:1fr; }
     .app .sidebar { grid-column:1; }
     .app .toc { grid-column:1; }
     .app .main { grid-column:1; }
@@ -1097,8 +1105,14 @@ INDEX_HTML = r"""<!doctype html>
     .composer { padding:11px 14px 13px; }
     .drawer { width:100vw; }
     .topbar { padding:10px 14px; gap:8px; }
-    .sess-title { max-width:140px; }
-    .book-select select { max-width:170px; }
+    /* 手机宽度一行放不下 5 个元素：去掉 book-meta（空状态里已写「作者 · 全部内容已建索引」），
+       书选择器吃满剩余宽度，其余按钮不换行、不收缩 —— 否则「新建对话」会被截成「新…」、
+       「目录」会折成两行。*/
+    .book-meta { display:none; }
+    .book-select { flex:1 1 auto; min-width:0; }
+    .book-select select { width:100%; max-width:none; }
+    .menu-btn, .toc-toggle { flex-shrink:0; white-space:nowrap; }
+    .sess-title { max-width:96px; flex-shrink:0; white-space:nowrap; }
   }
   .menu-btn { display:none; background:transparent; border:1px solid var(--line); color:var(--fg-dim);
               border-radius:var(--radius-sm); padding:5px 9px; cursor:pointer; font-size:13px; }
@@ -1194,6 +1208,8 @@ const $msgs = document.getElementById('msgs');
 const $q = document.getElementById('q');
 const $btn = document.getElementById('btn');
 const $title = document.getElementById('sessTitle');
+// API 基址：直连（/）和反代（/t/ragbook/）都能跑 —— 相对路径，不要硬编码前缀
+const BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]*$/, '');
 const $bookSel = document.getElementById('bookSel');
 const $bookMeta = document.getElementById('bookMeta');
 const $tocList = document.getElementById('tocList');
@@ -1207,7 +1223,7 @@ function currentBook() { return BOOKS.find(b => b.id === BOOK) || null; }
 
 // ===== 书清单 =====
 async function loadBooks() {
-  const r = await fetch('/t/ragbook/api/books');
+  const r = await fetch(BASE+'api/books');
   const d = await r.json();
   BOOKS = d.books || [];
   if (!BOOKS.length) {
@@ -1234,8 +1250,9 @@ function applyBook() {
   localStorage.setItem('ragbook_book', BOOK);
   renderOutline();
   renderEmpty();
+  // 占位文案也不按书硬编章号/术语：chapter 类统一给通用示例，避免黄仁勋那本提示「第8章·弱隔离级别」
   $q.placeholder = b.meta_kind === 'chapter'
-    ? '问点什么…（如「第8章讲什么」「弱隔离级别有哪些」）'
+    ? '问点什么…（如「第8章讲什么」「某一节讲了什么」）'
     : '问点什么…（如「快排怎么写」「TCP 三次握手为什么是三次」）';
 }
 
@@ -1293,12 +1310,26 @@ function askAbout(text) {
   send();
 }
 
+// 空状态的推荐问题：book.json 的 meta.suggestions > 按目录树推导 > 通用兜底。
+// 以前按 meta_kind 硬编第四章那四条，任何 chapter 类的书都套用 DDIA 的问题。
+function suggestionsFor(b) {
+  if (b.suggestions && b.suggestions.length) return b.suggestions.slice(0, 4);
+  const items = (b.outline && b.outline.items) || [];
+  if (b.meta_kind === 'chapter') {
+    const chs = items.filter(it => /^\d+$/.test(it.key || ''));
+    const picks = [chs[0], chs[Math.floor(chs.length / 2)], chs[chs.length - 1]].filter(Boolean);
+    const out = picks.map(it => `第${it.key}章讲了什么？`);
+    const withSec = chs.find(it => (it.sections || []).length > 1);
+    if (withSec) out.push(`「${withSec.sections[1]}」讲了什么？`);
+    if (out.length) return out.slice(0, 4);
+  }
+  return ['快速排序怎么实现？', 'TCP 三次握手为什么是三次？', 'B+ 树索引的原理？', 'MySQL 索引为什么用 B+ 树？'];
+}
+
 function renderEmpty() {
   const b = currentBook();
   if (!b) { $msgs.innerHTML = '<div class="empty"><h2>还没有可用的书</h2><p>先跑 parse.py + index.py 建索引</p></div>'; return; }
-  const sug = b.meta_kind === 'chapter'
-    ? ['第8章讲了什么？', '弱隔离级别有哪些？', '两阶段提交有什么问题？', 'LSM 树和 B+ 树的区别？']
-    : ['快速排序怎么实现？', 'TCP 三次握手为什么是三次？', 'B+ 树索引的原理？', 'MySQL 索引为什么用 B+ 树？'];
+  const sug = suggestionsFor(b);
   $msgs.innerHTML = `<div class="empty">
     <div class="eyebrow">${escape(b.subtitle || b.title)}</div>
     <h2>${escape(b.title)}</h2>
@@ -1322,7 +1353,7 @@ $title.addEventListener('click', () => {
     const newTitle = ($title.textContent || '').trim() || old;
     $title.textContent = newTitle;
     if (SID && newTitle !== old) {
-      fetch('/t/ragbook/api/sessions/' + SID + '/rename', {
+      fetch(BASE+'api/sessions/' + SID + '/rename', {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({title: newTitle})
       }).then(() => loadSessions());
@@ -1343,7 +1374,7 @@ $q.addEventListener('input', () => {
 });
 
 async function loadSessions() {
-  const r = await fetch('/t/ragbook/api/sessions');
+  const r = await fetch(BASE+'api/sessions');
   const d = await r.json();
   $list.innerHTML = '';
   if (!d.sessions.length) {
@@ -1384,7 +1415,7 @@ function relTime(ts) {
 }
 
 async function loadSession(sid) {
-  const r = await fetch('/t/ragbook/api/session/' + sid);
+  const r = await fetch(BASE+'api/session/' + sid);
   const d = await r.json();
   $msgs.innerHTML = '';
   if (!d.messages.length) {
@@ -1402,7 +1433,7 @@ async function switchSession(sid) {
   SID = sid;
   localStorage.setItem('ragbook_sid', SID);
   document.querySelectorAll('.sess-item').forEach(el => el.classList.toggle('active', el.dataset.sid === sid));
-  const r = await fetch('/t/ragbook/api/session/' + sid);
+  const r = await fetch(BASE+'api/session/' + sid);
   const d = await r.json();
   $title.textContent = d.title || '新对话';
   if (d.book && d.book !== BOOK) { BOOK = d.book; $bookSel.value = BOOK; applyBook(); }
@@ -1410,7 +1441,7 @@ async function switchSession(sid) {
 }
 
 async function newChat() {
-  const r = await fetch('/t/ragbook/api/sessions', {
+  const r = await fetch(BASE+'api/sessions', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({book: BOOK})
   });
@@ -1429,7 +1460,7 @@ async function renameInline(ev, sid) {
   const old = titleEl.textContent;
   const neu = prompt('新标题：', old);
   if (neu === null || neu.trim() === '' || neu === old) return;
-  await fetch('/t/ragbook/api/sessions/' + sid + '/rename', {
+  await fetch(BASE+'api/sessions/' + sid + '/rename', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({title: neu.trim().slice(0,80)})
   });
@@ -1440,7 +1471,7 @@ async function renameInline(ev, sid) {
 async function delSession(ev, sid) {
   ev.stopPropagation();
   if (!confirm('删除这个会话？')) return;
-  await fetch('/t/ragbook/api/sessions/' + sid, {method:'DELETE'});
+  await fetch(BASE+'api/sessions/' + sid, {method:'DELETE'});
   if (sid === SID) {
     SID = null;
     localStorage.removeItem('ragbook_sid');
@@ -1455,7 +1486,7 @@ async function send() {
   const q = $q.value.trim();
   if (!q) return;
   if (!SID) {
-    const r = await fetch('/t/ragbook/api/sessions', {
+    const r = await fetch(BASE+'api/sessions', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({book: BOOK})
     });
@@ -1471,7 +1502,7 @@ async function send() {
   const ctrl = new AbortController();
   const guard = setTimeout(() => ctrl.abort(), 120000);
   try {
-    const r = await fetch('/t/ragbook/api/ask', {
+    const r = await fetch(BASE+'api/ask', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ query:q, session_id:SID, top_k:5, book:BOOK }),
       signal: ctrl.signal
@@ -1558,7 +1589,7 @@ async function openSource(book, source, anchor, msgDiv) {
   try {
     let html = sourceCache[key];
     if (!html) {
-      const url = '/t/ragbook/api/chapter/' + encodeURIComponent(book) + '/' +
+      const url = BASE+'api/chapter/' + encodeURIComponent(book) + '/' +
                   source.split('#')[0].split('/').map(encodeURIComponent).join('/');
       const r = await fetch(url);
       const d = await r.json();
