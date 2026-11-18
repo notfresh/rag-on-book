@@ -47,7 +47,8 @@ VECTOR_DB_NAME = "book_chunks.db"
 # 支持的解析策略（parse.py 按这个分派）
 KIND_CHAPTER_BOOK = "chapter_book"
 KIND_NOTE_SET = "note_set"
-SUPPORTED_KINDS = (KIND_CHAPTER_BOOK, KIND_NOTE_SET)
+KIND_OCR_BOOK = "ocr_book"        # OCR 版面 JSON（PaddleOCR-VL 等）
+SUPPORTED_KINDS = (KIND_CHAPTER_BOOK, KIND_NOTE_SET, KIND_OCR_BOOK)
 
 # 支持的元信息提问策略
 META_CHAPTER = "chapter"

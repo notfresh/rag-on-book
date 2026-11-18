@@ -1,0 +1,11 @@
+{
+  "id": "huang-renxun",
+  "title": "黄仁勋：英伟达之芯",
+  "subtitle": "The Thinking Machine · Jensen Huang, Nvidia, and the World's Most Coveted Microchip",
+  "author": "[美] 斯蒂芬·威特",
+  "kind": "ocr_book",
+  "ocr_json": "source/ocr-layout.json",
+  "meta": {
+    "kind": "chapter"
+  }
+}

@@ -455,11 +455,22 @@ def parse_note_set(book: dict) -> tuple[list[dict], list[str], dict]:
     return chunks, md_files, outline
 
 
+# ---------- 策略 3：ocr_book（OCR 版面 JSON 的一本书） ----------
+# 载体与前两种不同：源不是 markdown，而是 PaddleOCR-VL 的版面 JSON。
+# 章节/段落从版面信息还原（见 ocr_parser.py 顶部的实测事实）。
+
+def parse_ocr_book(book: dict) -> tuple[list[dict], list[str], dict]:
+    """按 OCR 版面 JSON 解析。返回 (chunks, md_files, outline)。"""
+    import ocr_parser
+    return ocr_parser.parse_ocr_book(book, chunk_text)
+
+
 # ---------- 分派 ----------
 
 PARSERS = {
     books_mod.KIND_CHAPTER_BOOK: parse_chapter_book,
     books_mod.KIND_NOTE_SET: parse_note_set,
+    books_mod.KIND_OCR_BOOK: parse_ocr_book,
 }
 
 

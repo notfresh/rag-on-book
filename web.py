@@ -358,20 +358,24 @@ def detect_meta_query(query: str, book: dict) -> tuple[str | None, dict]:
 
 
 def _detect_chapter_query(query: str, book: dict) -> tuple[str | None, dict]:
-    """章节式："第N章" / "第N章某节"。
+    """章节式："第N章" / "第N章某节"。章节表从 outline.json 读（parse.py 自动生成）。
 
-    章节表从 outline.json 读（parse.py 自动生成），不再手写硬编码字典。
+    注意（2026-11-18）：outline.items 里除了正文章，还有"前置/后记/致谢/导读"
+    这些附加条目（OCR 版面书的附加区域）。判断章号范围时**只能数正文章**，
+    否则 max_chapter 会把附加条目也算进去（32 而不是 23），越界提示就错了。
     """
     outline = get_outline(book["id"])
     items = outline.get("items") or []
-    by_key = {it["key"]: it for it in items}
+    # 没有 kind 字段的（旧书 DDIA）都是正文章
+    chapters = [it for it in items if (it.get("kind") or "chapter") == "chapter"]
+    by_key = {it["key"]: it for it in chapters}
 
     ch_num = books_mod.detect_chapter_num(query)
     if not ch_num:
         return None, {}
     if ch_num not in by_key:
         # 边界：用户问的章号超出范围 → 上层直接提示，不调 LLM
-        return None, {"out_of_range": True, "max_chapter": len(items), "chapter": ch_num}
+        return None, {"out_of_range": True, "max_chapter": len(chapters), "chapter": ch_num}
 
     item = by_key[ch_num]
     ch_title = item.get("title", "")
@@ -1253,11 +1257,20 @@ function renderOutline() {
   if (items.length) app.classList.add('with-toc'); else app.classList.remove('with-toc');
   if (OUTLINE.kind === 'chapter') {
     $tocTitle.textContent = '章节';
+    // it.kind 区分条目类型（parse.py 生成）：
+    //   chapter = 正文章（key 是章号）| region = 前置/后记/致谢 | guide = 导读文章
+    // 三类的提问文案不同：章用"第N章 标题"，其余直接用标题。
+    const askText = it => it.kind === 'chapter'
+      ? `第${it.key}章 ${it.title}`
+      : (it.title || '');
     $tocList.innerHTML = items.map(it => {
       const subs = (it.sections || []).map(s =>
-        `<div class="toc-item sub" onclick="askAbout('第${escape(it.key)}章 ${escape(it.title)}')">${escape(s)}</div>`).join('');
-      return `<div class="toc-item" onclick="askAbout('第${escape(it.key)}章 ${escape(it.title)}')">
-                <span>${escape(it.key)} · ${escape(it.title)}</span></div>${subs}`;
+        `<div class="toc-item sub" onclick="askAbout('${escape(askText(it)).replace(/'/g, "\\'")} ${escape(s).replace(/'/g, "\\'")}')">${escape(s)}</div>`).join('');
+      const label = it.kind === 'chapter'
+        ? `${escape(it.key)} · ${escape(it.title)}`
+        : escape(it.title);
+      return `<div class="toc-item" onclick="askAbout('${escape(askText(it)).replace(/'/g, "\\'")}')">
+                <span>${label}</span></div>${subs}`;
     }).join('');
   } else {
     $tocTitle.textContent = '主题';
